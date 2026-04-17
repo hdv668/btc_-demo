@@ -168,7 +168,7 @@ export interface PortfolioRisk {
 }
 
 // ─── 数据源 ───────────────────────────────────────────────────────────
-export type DataSource = 'deribit' | 'polygon' | 'mock';
+export type DataSource = 'deribit' | 'bybit' | 'binance' | 'polygon' | 'mock';
 
 export interface MarketSnapshot {
   symbol: string;
@@ -176,6 +176,8 @@ export interface MarketSnapshot {
   underlyingPrice: number;
   fetchedAt: number;
   contracts: OptionContract[];
+  isMock: boolean;        // 新增：是否为 mock 数据
+  exchangeId?: string;    // 新增：交易所 ID
 }
 
 // ─── 曲面分析结果 ──────────────────────────────────────────────────────

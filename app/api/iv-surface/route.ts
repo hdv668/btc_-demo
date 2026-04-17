@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { fetchBTCOptions } from '@/lib/data/fetcher';
 
 // ─────────────────────────────────────────────
 //  1. Black-Scholes 正向定价 (The Forward Model)
@@ -455,27 +456,6 @@ function calcPnL(
   return { currentPrice: cMarket, targetPrice: cTarget, shockPrice: cShock, expectedProfit, expectedLoss };
 }
 
-// ─────────────────────────────────────────────
-//  Deribit 数据拉取
-// ─────────────────────────────────────────────
-async function fetchDeribitOptions(): Promise<{ result: any[]; indexPrice: number; fetchedAt: number }> {
-  const fetchedAt = Date.now();
-  // 并发：合约摘要 + 指数价格（独立接口，避免 underlying_price 取到过期缓存值）
-  const [bookRes, idxRes] = await Promise.all([
-    fetch(
-      'https://deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option',
-      { next: { revalidate: 0 } }
-    ),
-    fetch(
-      'https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd',
-      { next: { revalidate: 0 }, signal: AbortSignal.timeout(8000) }
-    ),
-  ]);
-  if (!bookRes.ok) throw new Error(`Deribit book_summary error: ${bookRes.status}`);
-  const [bookJson, idxJson] = await Promise.all([bookRes.json(), idxRes.json()]);
-  const indexPrice: number = idxJson.result?.index_price ?? 0;
-  return { result: bookJson.result ?? [], indexPrice, fetchedAt };
-}
 
 // ─────────────────────────────────────────────
 //  数据结构定义
@@ -559,7 +539,10 @@ export async function GET(req: NextRequest) {
     const stressMode = sp.get('stress') === '1';
     const stressCount = Math.min(10, Math.max(1, parseInt(sp.get('stressCount') ?? '5')));
 
-    const { result: raw, indexPrice, fetchedAt: windowTs } = await fetchDeribitOptions();
+    // 使用健壮的 fetcher 层（已包含回退机制）
+    const snapshot = await fetchBTCOptions();
+    const windowTs = snapshot.fetchedAt;
+    const underlying = snapshot.underlyingPrice;
     const r = 0.0;
 
     interface RawPoint {
@@ -576,73 +559,37 @@ export async function GET(req: NextRequest) {
       S: number;
     }
 
-    // 使用独立 get_index_price 接口的实时价格，不依赖合约数据里的 underlying_price
-    const underlying = indexPrice > 0
-      ? indexPrice
-      : (raw.find((x: any) => x.underlying_price)?.underlying_price ?? 0);
-    const rawPoints: RawPoint[] = [];
+    // 转换数据格式
+    const rawPoints: RawPoint[] = snapshot.contracts
+      .filter(c => c.optionType === 'call') // 只保留看涨期权，与原代码一致
+      .map(c => {
+        // 从合约构造 instrument_name（用于兼容）
+        const expiryParts = c.expiry.split('-');
+        const yy = expiryParts[0].slice(2);
+        const mmNum = parseInt(expiryParts[1]);
+        const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+        const mm = months[mmNum - 1];
+        const dd = expiryParts[2];
+        const instrumentName = `BTC-${dd}${mm}${yy}-${Math.round(c.strike)}-C`;
 
-    for (const item of raw) {
-      const name: string = item.instrument_name ?? '';
-      const parts = name.split('-');
-      if (parts.length !== 4) continue;
-      const [, expiryStr, strikeStr, optType] = parts;
-      if (optType !== 'C') continue;
+        // 估算 BTC 计价的 bid/ask（原代码需要）
+        const bidPriceBtc = c.bid / c.underlyingPrice;
+        const askPriceBtc = c.ask / c.underlyingPrice;
 
-      const bid: number = item.bid_price;
-      const ask: number = item.ask_price;
-      // 统一用独立获取的 index_price，不用合约里的 underlying_price（可能过期）
-      const S: number = underlying;
-      if (!bid || !ask || bid <= 0 || ask <= 0 || !S) continue;
-
-      const strike = parseFloat(strikeStr);
-
-      let expiry: Date;
-      try {
-        expiry = new Date(`${expiryStr.slice(0, -2)} 20${expiryStr.slice(-2)} 08:00:00 UTC`);
-        if (isNaN(expiry.getTime())) {
-          const months: Record<string, number> = {
-            JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5,
-            JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11,
-          };
-          const day = parseInt(expiryStr.replace(/[A-Z]/g, ''));
-          const monStr = expiryStr.slice(-5, -2).toUpperCase();
-          const yr = 2000 + parseInt(expiryStr.slice(-2));
-          expiry = new Date(Date.UTC(yr, months[monStr], day, 8, 0, 0));
-        }
-      } catch { continue; }
-      if (isNaN(expiry.getTime())) continue;
-
-      const T = (expiry.getTime() - windowTs) / (365 * 24 * 3600 * 1000);
-      if (T <= 1 / 365) continue;
-
-      const midUsd = ((bid + ask) / 2) * S;
-      const bidUsd = bid * S;
-      const askUsd = ask * S;
-
-      const iv = impliedVolatility(S, strike, T, r, midUsd);
-      const ivBid = impliedVolatility(S, strike, T, r, bidUsd);
-      const ivAsk = impliedVolatility(S, strike, T, r, askUsd);
-
-      if (iv === null || iv < 0.05 || iv > 3.0) continue;
-      if (strike < S * 0.4 || strike > S * 2.0) continue;
-
-      const spreadPct = (ask - bid) / ((bid + ask) / 2);
-
-      rawPoints.push({
-        instrument: name,
-        strike,
-        tenor: T,
-        iv,
-        ivBid: ivBid ?? iv,
-        ivAsk: ivAsk ?? iv,
-        bidPrice: bid,
-        askPrice: ask,
-        expiry: expiryStr,
-        spreadPct,
-        S,
+        return {
+          instrument: instrumentName,
+          strike: c.strike,
+          tenor: c.tte,
+          iv: c.impliedVol,
+          ivBid: c.impliedVol * 0.98, // 模拟 bid IV
+          ivAsk: c.impliedVol * 1.02, // 模拟 ask IV
+          bidPrice: bidPriceBtc,
+          askPrice: askPriceBtc,
+          expiry: `${dd}${mm}${yy}`,
+          spreadPct: (c.ask - c.bid) / ((c.bid + c.ask) / 2),
+          S: c.underlyingPrice,
+        };
       });
-    }
 
     if (rawPoints.length < 6) {
       return NextResponse.json({ error: '有效期权数据不足，无法构建曲面' }, { status: 422 });

@@ -42,23 +42,26 @@ export class DeribitFetcher implements ExchangeFetcher {
 
   async fetchOptions(): Promise<MarketSnapshot> {
     try {
-      const [instrRes, idxRes] = await Promise.all([
-        fetch(
-          'https://www.deribit.com/api/v2/public/get_instruments?currency=BTC&kind=option&expired=false',
-          { signal: AbortSignal.timeout(10000) }
-        ),
-        fetch(
-          'https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd',
-          { signal: AbortSignal.timeout(8000) }
-        ),
-      ]);
-
-      if (!instrRes.ok) throw new Error('deribit instruments failed');
-      const [instrData, idxData] = await Promise.all([instrRes.json(), idxRes.json()]);
-
-      const allInstruments: any[] = (instrData.result ?? []).filter((i: any) => i.is_active);
+      // 先获取 index price（更快）
+      const idxRes = await fetch(
+        'https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd',
+        { signal: AbortSignal.timeout(15000) }
+      );
+      if (!idxRes.ok) throw new Error('deribit index price failed');
+      const idxData = await idxRes.json();
       const spot: number = idxData.result?.index_price ?? 0;
       if (spot <= 0) throw new Error('invalid BTC index price');
+
+      // 再获取 instruments
+      const instrRes = await fetch(
+        'https://www.deribit.com/api/v2/public/get_instruments?currency=BTC&kind=option&expired=false',
+        { signal: AbortSignal.timeout(20000) }
+      );
+
+      if (!instrRes.ok) throw new Error('deribit instruments failed');
+      const instrData = await instrRes.json();
+
+      const allInstruments: any[] = (instrData.result ?? []).filter((i: any) => i.is_active);
 
       const byExpiry = new Map<string, any[]>();
       for (const inst of allInstruments) {
@@ -67,7 +70,7 @@ export class DeribitFetcher implements ExchangeFetcher {
         byExpiry.get(exp)!.push(inst);
       }
 
-      const MAX_PER_EXPIRY = 20;
+      const MAX_PER_EXPIRY = 15;
       const selectedInsts: any[] = [];
       for (const group of byExpiry.values()) {
         if (group.length <= MAX_PER_EXPIRY) {
@@ -80,7 +83,7 @@ export class DeribitFetcher implements ExchangeFetcher {
         }
       }
 
-      const BATCH_SIZE = 50;
+      const BATCH_SIZE = 30;
       const tickerMap = new Map<string, any>();
 
       for (let i = 0; i < selectedInsts.length; i += BATCH_SIZE) {
@@ -89,7 +92,7 @@ export class DeribitFetcher implements ExchangeFetcher {
           batch.map(inst =>
             fetch(
               `https://www.deribit.com/api/v2/public/ticker?instrument_name=${inst.instrument_name}`,
-              { signal: AbortSignal.timeout(8000) }
+              { signal: AbortSignal.timeout(20000) }
             ).then(r => r.json()).catch(() => null)
           )
         );

@@ -13,6 +13,7 @@ function tte(expiry: string): number {
 }
 
 export function generateMockSnapshot(symbol: string, spot: number): MarketSnapshot {
+  console.log('[generateMockSnapshot] Starting with spot:', spot);
   const contracts: OptionContract[] = [];
   const today = new Date();
 
@@ -23,7 +24,7 @@ export function generateMockSnapshot(symbol: string, spot: number): MarketSnapsh
   });
 
   const baseSVI = {
-    a: 0.04, b: 0.3, rho: -0.35, m: 0.0, sigma: 0.25,
+    a: 0.005, b: 0.15, rho: -0.25, m: 0.0, sigma: 0.15,
   };
 
   const anomalySeeds: Set<string> = new Set();
@@ -71,6 +72,11 @@ export function generateMockSnapshot(symbol: string, spot: number): MarketSnapsh
         Math.sqrt((k - baseSVI.m) ** 2 + baseSVI.sigma ** 2)
       );
       let trueIV = Math.sqrt(Math.max(w / t, 0.01));
+
+      // 调试：检查 IV 值
+      if (trueIV > 2.0 || trueIV < 0.1) {
+        console.log(`[generateMockSnapshot] Warning: IV=${trueIV} for t=${t}, w=${w}`);
+      }
 
       const isAnomaly = anomalySeeds.has(`${ei}-${ki}`);
       let anomalyBump = 0;

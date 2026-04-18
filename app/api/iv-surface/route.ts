@@ -594,7 +594,8 @@ export async function GET(req: NextRequest) {
         const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
         const mm = months[mmNum - 1];
         const dd = expiryParts[2];
-        const instrumentName = `BTC-${dd}${mm}${yy}-${Math.round(c.strike)}-C`;
+        const optionSuffix = c.optionType === 'call' ? 'C' : 'P';
+        const instrumentName = `BTC-${dd}${mm}${yy}-${Math.round(c.strike)}-${optionSuffix}`;
 
         // 估算 BTC 计价的 bid/ask（原代码需要）
         const bidPriceBtc = c.bid / c.underlyingPrice;

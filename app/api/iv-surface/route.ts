@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { fetchBTCOptions } from '@/lib/data/fetcher';
+import { fetchOptionsByExchange, fetchBTCOptions } from '@/lib/data/fetcher';
+import type { ExchangeId, OptionTypeFilter } from '@/lib/data/exchanges/types';
 
 // ─────────────────────────────────────────────
 //  1. Black-Scholes 正向定价 (The Forward Model)
@@ -507,6 +508,8 @@ export interface SurfaceResponse {
   underpricedCount: number;
   sigmaThreshold: number;
   residualSigma: number;
+  isMock: boolean;
+  exchange: ExchangeId;
   // SVI 拟合参数（按到期日 key）
   sviParams: Record<string, SVIParams>;
   // RND 切片（按到期日 key）
@@ -536,11 +539,25 @@ export async function GET(req: NextRequest) {
     const smoothLambda = Math.min(1.0, Math.max(0.0, parseFloat(sp.get('smooth') ?? '0.05')));
 
     // 压力测试模式：随机给 N 个合约注入 ±20% IV 扰动
+    // 交易所参数，默认 deribit
+    const exchangeParam = sp.get('exchange') ?? 'deribit';
+    const exchange: ExchangeId =
+      (exchangeParam === 'deribit' || exchangeParam === 'bybit' || exchangeParam === 'binance')
+        ? exchangeParam as ExchangeId
+        : 'deribit';
+
+    // 期权类型参数，默认 both
+    const optionTypeParam = sp.get('optionType') ?? 'both';
+    const optionType: OptionTypeFilter =
+      (optionTypeParam === 'call' || optionTypeParam === 'put' || optionTypeParam === 'both')
+        ? optionTypeParam as OptionTypeFilter
+        : 'both';
+
     const stressMode = sp.get('stress') === '1';
     const stressCount = Math.min(10, Math.max(1, parseInt(sp.get('stressCount') ?? '5')));
 
     // 使用健壮的 fetcher 层（已包含回退机制）
-    const snapshot = await fetchBTCOptions();
+    const snapshot = await fetchOptionsByExchange(exchange);
     const windowTs = snapshot.fetchedAt;
     const underlying = snapshot.underlyingPrice;
     const r = 0.0;
@@ -560,8 +577,14 @@ export async function GET(req: NextRequest) {
     }
 
     // 转换数据格式
-    const rawPoints: RawPoint[] = snapshot.contracts
-      .filter(c => c.optionType === 'call') // 只保留看涨期权，与原代码一致
+    let contracts = snapshot.contracts;
+    if (optionType === 'call') {
+      contracts = contracts.filter(c => c.optionType === 'call');
+    } else if (optionType === 'put') {
+      contracts = contracts.filter(c => c.optionType === 'put');
+    }
+
+    const rawPoints: RawPoint[] = contracts
       .map(c => {
         // 从合约构造 instrument_name（用于兼容）
         const expiryParts = c.expiry.split('-');
@@ -732,6 +755,8 @@ export async function GET(req: NextRequest) {
       underpricedCount,
       sigmaThreshold: threshold,
       residualSigma: sigma,
+      isMock: snapshot.isMock,
+      exchange: exchange,
       // SVI/RND 由独立接口 /api/rnd-surface 提供（避免阻塞主接口）
       sviParams: {},
       rndSlices: {},

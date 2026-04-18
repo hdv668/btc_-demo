@@ -524,254 +524,243 @@ export interface SurfaceResponse {
   };
 }
 
+async function computeSurface(
+  snapshot: { contracts: any[], underlyingPrice: number, fetchedAt: number, isMock?: boolean },
+  options: {
+    sigmaMultiplier: number,
+    absPctThreshold: number,
+    smoothLambda: number,
+    stressMode: boolean,
+    stressCount: number,
+    optionType: OptionTypeFilter,
+    exchange: ExchangeId,
+  }
+) {
+  const { sigmaMultiplier, absPctThreshold, smoothLambda, stressMode, stressCount, optionType, exchange } = options;
+  const windowTs = snapshot.fetchedAt;
+  const underlying = snapshot.underlyingPrice;
+  const r = 0.0;
+
+  interface RawPoint {
+    instrument: string;
+    strike: number;
+    tenor: number;
+    iv: number;
+    ivBid: number;
+    ivAsk: number;
+    bidPrice: number;
+    askPrice: number;
+    expiry: string;
+    spreadPct: number;
+    S: number;
+  }
+
+  let contracts = snapshot.contracts;
+  if (optionType === 'call') {
+    contracts = contracts.filter(c => c.optionType === 'call');
+  } else if (optionType === 'put') {
+    contracts = contracts.filter(c => c.optionType === 'put');
+  }
+
+  const rawPoints: RawPoint[] = contracts
+    .filter(c => c.impliedVol != null)
+    .map(c => {
+      const expiryParts = c.expiry.split('-');
+      const yy = expiryParts[0].slice(2);
+      const mmNum = parseInt(expiryParts[1]);
+      const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+      const mm = months[mmNum - 1];
+      const dd = expiryParts[2];
+      const optionSuffix = c.optionType === 'call' ? 'C' : 'P';
+      const instrumentName = `BTC-${dd}${mm}${yy}-${Math.round(c.strike)}-${optionSuffix}`;
+
+      const bidPriceBtc = c.bid / c.underlyingPrice;
+      const askPriceBtc = c.ask / c.underlyingPrice;
+      const iv = c.impliedVol!;
+
+      return {
+        instrument: instrumentName,
+        strike: c.strike,
+        tenor: c.tte,
+        iv: iv,
+        ivBid: iv * 0.98,
+        ivAsk: iv * 1.02,
+        bidPrice: bidPriceBtc,
+        askPrice: askPriceBtc,
+        expiry: `${dd}${mm}${yy}`,
+        spreadPct: (c.ask - c.bid) / ((c.bid + c.ask) / 2),
+        S: c.underlyingPrice,
+      };
+    });
+
+  if (rawPoints.length < 6) {
+    throw new Error('有效期权数据不足，无法构建曲面');
+  }
+
+  const stressMap = new Map<string, number>();
+
+  if (stressMode) {
+    const seed = Math.floor(windowTs / 60000);
+    const lcg = (s: number) => (s * 1664525 + 1013904223) & 0xffffffff;
+
+    let rng = seed;
+    const indices = rawPoints.map((_, i) => i);
+    for (let i = indices.length - 1; i > 0; i--) {
+      rng = lcg(rng);
+      const j = Math.abs(rng) % (i + 1);
+      [indices[i], indices[j]] = [indices[j], indices[i]];
+    }
+    const stressIndices = indices.slice(0, stressCount);
+
+    for (const idx of stressIndices) {
+      rng = lcg(rng);
+      const direction = Math.abs(rng) % 2 === 0 ? 1 : -1;
+      const amt = direction * 0.20;
+
+      stressMap.set(rawPoints[idx].instrument, amt);
+
+      rawPoints[idx].iv = Math.max(rawPoints[idx].iv + amt, 0.05);
+      rawPoints[idx].ivBid = Math.max(rawPoints[idx].ivBid + amt, 0.05);
+      rawPoints[idx].ivAsk = Math.max(rawPoints[idx].ivAsk + amt, 0.05);
+    }
+  }
+
+  const RBF_MAX = 120;
+  let rbfPoints = rawPoints;
+  if (rawPoints.length > RBF_MAX) {
+    const step = rawPoints.length / RBF_MAX;
+    rbfPoints = Array.from({ length: RBF_MAX }, (_, i) => rawPoints[Math.round(i * step)]);
+  }
+
+  const srcK = rbfPoints.map(p => p.strike);
+  const srcT = rbfPoints.map(p => p.tenor);
+  const srcIV = rbfPoints.map(p => p.iv);
+
+  const qK = rawPoints.map(p => p.strike);
+  const qT = rawPoints.map(p => p.tenor);
+  const ivSurfaceValues = rbfCubicInterpolate(srcK, srcT, srcIV, qK, qT, smoothLambda);
+
+  const residuals = rawPoints.map((p, i) => p.iv - ivSurfaceValues[i]);
+  const meanRes = residuals.reduce((a, b) => a + b, 0) / residuals.length;
+  const variance = residuals.reduce((a, b) => a + (b - meanRes) ** 2, 0) / residuals.length;
+  const sigma = Math.sqrt(variance);
+
+  const threshold = sigmaMultiplier * sigma;
+
+  const points: IVPoint[] = rawPoints.map((p, i) => {
+    const ivSurface = Math.max(ivSurfaceValues[i], 0.001);
+    const residual = residuals[i];
+
+    const absDev = Math.abs(residual) / ivSurface;
+
+    let anomalyType: 'overpriced' | 'underpriced' | 'normal' = 'normal';
+
+    if (residual > 0) {
+      const sigmaHit = residual > threshold && p.ivBid > ivSurface + threshold;
+      const absPctHit = absPctThreshold > 0 && absDev > absPctThreshold;
+      if (sigmaHit || absPctHit) anomalyType = 'overpriced';
+    } else {
+      const sigmaHit = residual < -threshold && p.ivAsk < ivSurface - threshold;
+      const absPctHit = absPctThreshold > 0 && absDev > absPctThreshold;
+      if (sigmaHit || absPctHit) anomalyType = 'underpriced';
+    }
+
+    const stressAmt = stressMap.get(p.instrument);
+    const base: IVPoint = {
+      ...p,
+      underlyingPrice: p.S,
+      ivSurface,
+      residual,
+      anomalyType,
+      ...(stressAmt !== undefined ? { stressInjected: true, stressAmt } : {}),
+    };
+
+    if (anomalyType !== 'normal') {
+      const winProb = calcWinProb(residual, sigma);
+      const pnl = calcPnL(p.S, p.strike, p.tenor, r, p.iv, ivSurface, sigma, anomalyType);
+      const ev = winProb * pnl.expectedProfit - (1 - winProb) * pnl.expectedLoss;
+
+      const stopLossIV = anomalyType === 'overpriced'
+        ? p.iv + 3.5 * sigma
+        : Math.max(p.iv - 3.5 * sigma, 0.01);
+
+      base.tradeAnalysis = {
+        winProb,
+        currentPrice: pnl.currentPrice,
+        targetPrice: pnl.targetPrice,
+        shockPrice: pnl.shockPrice,
+        expectedProfit: pnl.expectedProfit,
+        expectedLoss: pnl.expectedLoss,
+        ev,
+        takeProfitIV: ivSurface,
+        stopLossIV,
+      };
+    }
+
+    return base;
+  });
+
+  const overpricedCount = points.filter(p => p.anomalyType === 'overpriced').length;
+  const underpricedCount = points.filter(p => p.anomalyType === 'underpriced').length;
+
+  return {
+    points,
+    underlyingPrice: underlying,
+    fetchedAt: new Date(windowTs).toISOString(),
+    count: points.length,
+    overpricedCount,
+    underpricedCount,
+    sigmaThreshold: threshold,
+    residualSigma: sigma,
+    isMock: snapshot.isMock ?? false,
+    exchange: exchange,
+    sviParams: {},
+    rndSlices: {},
+    params: {
+      sigmaMultiplier,
+      absPctThreshold,
+      smoothLambda,
+      stressMode,
+      stressCount: stressMode ? stressCount : 0,
+    },
+  };
+}
+
 export async function GET(req: NextRequest) {
   try {
-    // ── 解析查询参数 ──
     const sp = req.nextUrl.searchParams;
-
-    // 灵敏度：σ 倍数，默认 2.0，范围 0.5–3.0
     const sigmaMultiplier = Math.min(3.0, Math.max(0.5, parseFloat(sp.get('sigma') ?? '2.0')));
-
-    // 绝对百分比阈值（如 0.10 = 10%）；0 = 不启用
     const absPctThreshold = Math.min(1.0, Math.max(0.0, parseFloat(sp.get('absPct') ?? '0.10')));
-
-    // RBF 正则化强度，默认 0.05（弱平滑）；0 = 完全插值
     const smoothLambda = Math.min(1.0, Math.max(0.0, parseFloat(sp.get('smooth') ?? '0.05')));
-
-    // 压力测试模式：随机给 N 个合约注入 ±20% IV 扰动
-    // 交易所参数，默认 deribit
     const exchangeParam = sp.get('exchange') ?? 'deribit';
     const exchange: ExchangeId =
       (exchangeParam === 'deribit' || exchangeParam === 'bybit' || exchangeParam === 'binance')
         ? exchangeParam as ExchangeId
         : 'deribit';
-
-    // 期权类型参数，默认 both
     const optionTypeParam = sp.get('optionType') ?? 'both';
     const optionType: OptionTypeFilter =
       (optionTypeParam === 'call' || optionTypeParam === 'put' || optionTypeParam === 'both')
         ? optionTypeParam as OptionTypeFilter
         : 'both';
-
     const stressMode = sp.get('stress') === '1';
     const stressCount = Math.min(10, Math.max(1, parseInt(sp.get('stressCount') ?? '5')));
 
-    // 使用健壮的 fetcher 层（已包含回退机制）
     const snapshot = await fetchOptionsByExchange(exchange);
-    const windowTs = snapshot.fetchedAt;
-    const underlying = snapshot.underlyingPrice;
-    const r = 0.0;
-
-    interface RawPoint {
-      instrument: string;
-      strike: number;
-      tenor: number;
-      iv: number;
-      ivBid: number;
-      ivAsk: number;
-      bidPrice: number;
-      askPrice: number;
-      expiry: string;
-      spreadPct: number;
-      S: number;
-    }
-
-    // 转换数据格式
-    let contracts = snapshot.contracts;
-    if (optionType === 'call') {
-      contracts = contracts.filter(c => c.optionType === 'call');
-    } else if (optionType === 'put') {
-      contracts = contracts.filter(c => c.optionType === 'put');
-    }
-
-    const rawPoints: RawPoint[] = contracts
-      .filter(c => c.impliedVol != null)
-      .map(c => {
-        // 从合约构造 instrument_name（用于兼容）
-        const expiryParts = c.expiry.split('-');
-        const yy = expiryParts[0].slice(2);
-        const mmNum = parseInt(expiryParts[1]);
-        const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
-        const mm = months[mmNum - 1];
-        const dd = expiryParts[2];
-        const optionSuffix = c.optionType === 'call' ? 'C' : 'P';
-        const instrumentName = `BTC-${dd}${mm}${yy}-${Math.round(c.strike)}-${optionSuffix}`;
-
-        // 估算 BTC 计价的 bid/ask（原代码需要）
-        const bidPriceBtc = c.bid / c.underlyingPrice;
-        const askPriceBtc = c.ask / c.underlyingPrice;
-        const iv = c.impliedVol!;
-
-        return {
-          instrument: instrumentName,
-          strike: c.strike,
-          tenor: c.tte,
-          iv: iv,
-          ivBid: iv * 0.98, // 模拟 bid IV
-          ivAsk: iv * 1.02, // 模拟 ask IV
-          bidPrice: bidPriceBtc,
-          askPrice: askPriceBtc,
-          expiry: `${dd}${mm}${yy}`,
-          spreadPct: (c.ask - c.bid) / ((c.bid + c.ask) / 2),
-          S: c.underlyingPrice,
-        };
-      });
-
-    if (rawPoints.length < 6) {
-      return NextResponse.json({ error: '有效期权数据不足，无法构建曲面' }, { status: 422 });
-    }
-
-    // ── 压力测试：随机选 stressCount 个合约注入 ±20% IV 扰动 ──
-    // 扰动记录：保留原始 iv，修改 iv/ivBid/ivAsk
-    const stressMap = new Map<string, number>(); // instrument -> 扰动量（小数）
-
-    if (stressMode) {
-      // 使用确定性伪随机（基于时间戳种子），同一次请求结果一致
-      const seed = Math.floor(windowTs / 60000); // 分钟级固定种子
-      const lcg = (s: number) => (s * 1664525 + 1013904223) & 0xffffffff;
-
-      let rng = seed;
-      // 随机打乱并取前 stressCount 个
-      const indices = rawPoints.map((_, i) => i);
-      for (let i = indices.length - 1; i > 0; i--) {
-        rng = lcg(rng);
-        const j = Math.abs(rng) % (i + 1);
-        [indices[i], indices[j]] = [indices[j], indices[i]];
-      }
-      const stressIndices = indices.slice(0, stressCount);
-
-      for (const idx of stressIndices) {
-        rng = lcg(rng);
-        // ±20% IV 扰动，正负随机
-        const direction = Math.abs(rng) % 2 === 0 ? 1 : -1;
-        const amt = direction * 0.20; // 20% 扰动
-
-        stressMap.set(rawPoints[idx].instrument, amt);
-
-        // 修改该合约的 IV（确保不低于 0.05）
-        rawPoints[idx].iv = Math.max(rawPoints[idx].iv + amt, 0.05);
-        rawPoints[idx].ivBid = Math.max(rawPoints[idx].ivBid + amt, 0.05);
-        rawPoints[idx].ivAsk = Math.max(rawPoints[idx].ivAsk + amt, 0.05);
-      }
-    }
-
-    // ── Step 2：构建正则化 RBF 基准曲面 ──
-    // smoothLambda 越大，曲面越平滑，异常点的残差越显著
-    //
-    // ⚠️ RBF 矩阵复杂度 O(n³)：n=500 时约 1.25亿次运算，会卡死 Node.js 主线程。
-    //    对数据做均匀降采样，保留至多 RBF_MAX 个支撑点用于建曲面，
-    //    再对全量散点做插值（仅 O(n_full × n_rbf)）。
-    const RBF_MAX = 120; // 120³ ≈ 170万次，约 5-10ms，安全范围
-    let rbfPoints = rawPoints;
-    if (rawPoints.length > RBF_MAX) {
-      const step = rawPoints.length / RBF_MAX;
-      rbfPoints = Array.from({ length: RBF_MAX }, (_, i) => rawPoints[Math.round(i * step)]);
-    }
-
-    const srcK = rbfPoints.map(p => p.strike);
-    const srcT = rbfPoints.map(p => p.tenor);
-    const srcIV = rbfPoints.map(p => p.iv);
-
-    // 对全量点插值（query 点为全量 rawPoints）
-    const qK = rawPoints.map(p => p.strike);
-    const qT = rawPoints.map(p => p.tenor);
-    const ivSurfaceValues = rbfCubicInterpolate(srcK, srcT, srcIV, qK, qT, smoothLambda);
-
-    // ── Step 3：计算残差标准差 σ ──
-    const residuals = rawPoints.map((p, i) => p.iv - ivSurfaceValues[i]);
-    const meanRes = residuals.reduce((a, b) => a + b, 0) / residuals.length;
-    const variance = residuals.reduce((a, b) => a + (b - meanRes) ** 2, 0) / residuals.length;
-    const sigma = Math.sqrt(variance);
-
-    // 用户指定的 σ 倍数：threshold = sigmaMultiplier * sigma
-    const threshold = sigmaMultiplier * sigma;
-
-    // ── Step 4：双判定异常检测 ──
-    // 判定1（统计学）：|ε| > sigmaMultiplier * σ 且 bid/ask 侧 IV 同向确认
-    // 判定2（绝对百分比）：|(IV_market - IV_surface) / IV_surface| > absPctThreshold
-    // 两个条件满足其一即标记为异常
-    const points: IVPoint[] = rawPoints.map((p, i) => {
-      const ivSurface = Math.max(ivSurfaceValues[i], 0.001);
-      const residual = residuals[i];
-
-      // 绝对百分比偏离
-      const absDev = Math.abs(residual) / ivSurface;
-
-      let anomalyType: 'overpriced' | 'underpriced' | 'normal' = 'normal';
-
-      if (residual > 0) {
-        // 高估方向
-        const sigmaHit = residual > threshold && p.ivBid > ivSurface + threshold;
-        const absPctHit = absPctThreshold > 0 && absDev > absPctThreshold;
-        if (sigmaHit || absPctHit) anomalyType = 'overpriced';
-      } else {
-        // 低估方向
-        const sigmaHit = residual < -threshold && p.ivAsk < ivSurface - threshold;
-        const absPctHit = absPctThreshold > 0 && absDev > absPctThreshold;
-        if (sigmaHit || absPctHit) anomalyType = 'underpriced';
-      }
-
-      const stressAmt = stressMap.get(p.instrument);
-      const base: IVPoint = {
-        ...p,
-        underlyingPrice: p.S,
-        ivSurface,
-        residual,
-        anomalyType,
-        ...(stressAmt !== undefined ? { stressInjected: true, stressAmt } : {}),
-      };
-
-      if (anomalyType !== 'normal') {
-        const winProb = calcWinProb(residual, sigma);
-        const pnl = calcPnL(p.S, p.strike, p.tenor, r, p.iv, ivSurface, sigma, anomalyType);
-        const ev = winProb * pnl.expectedProfit - (1 - winProb) * pnl.expectedLoss;
-
-        const stopLossIV = anomalyType === 'overpriced'
-          ? p.iv + 3.5 * sigma
-          : Math.max(p.iv - 3.5 * sigma, 0.01);
-
-        base.tradeAnalysis = {
-          winProb,
-          currentPrice: pnl.currentPrice,
-          targetPrice: pnl.targetPrice,
-          shockPrice: pnl.shockPrice,
-          expectedProfit: pnl.expectedProfit,
-          expectedLoss: pnl.expectedLoss,
-          ev,
-          takeProfitIV: ivSurface,
-          stopLossIV,
-        };
-      }
-
-      return base;
+    const result = await computeSurface(snapshot, {
+      sigmaMultiplier, absPctThreshold, smoothLambda, stressMode, stressCount, optionType, exchange
     });
+    return NextResponse.json(result satisfies SurfaceResponse);
+  } catch (err: any) {
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
 
-    const overpricedCount = points.filter(p => p.anomalyType === 'overpriced').length;
-    const underpricedCount = points.filter(p => p.anomalyType === 'underpriced').length;
-
-    return NextResponse.json({
-      points,
-      underlyingPrice: underlying,
-      fetchedAt: new Date(windowTs).toISOString(),
-      count: points.length,
-      overpricedCount,
-      underpricedCount,
-      sigmaThreshold: threshold,
-      residualSigma: sigma,
-      isMock: snapshot.isMock,
-      exchange: exchange,
-      // SVI/RND 由独立接口 /api/rnd-surface 提供（避免阻塞主接口）
-      sviParams: {},
-      rndSlices: {},
-      params: {
-        sigmaMultiplier,
-        absPctThreshold,
-        smoothLambda,
-        stressMode,
-        stressCount: stressMode ? stressCount : 0,
-      },
-    } satisfies SurfaceResponse);
-
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
+    const { snapshot, options } = body;
+    const result = await computeSurface(snapshot, options);
+    return NextResponse.json(result satisfies SurfaceResponse);
   } catch (err: any) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }

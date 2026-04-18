@@ -4,6 +4,7 @@ import type { OptionContract, MarketSnapshot } from '@/types';
 import { impliedVol } from '@/lib/engine/blackScholes';
 import { differenceInCalendarDays, parseISO } from 'date-fns';
 import { generateMockSnapshot } from '@/lib/data/fetcher';
+import axios from 'axios';
 
 const RISK_FREE = 0.05;
 
@@ -18,7 +19,7 @@ function moneyness(strike: number, forward: number, t: number): number {
 }
 
 function parseDeribitExpiry(raw: string): string | null {
-  const m = raw.match(/^(\d{1,2})([A-Z]{3})(\d{2})$/);
+  const m = raw.match(/^(\\d{1,2})([A-Z]{3})(\\d{2})$/);
   if (!m) return null;
   const months: Record<string, string> = {
     JAN: '01', FEB: '02', MAR: '03', APR: '04', MAY: '05', JUN: '06',
@@ -41,27 +42,26 @@ export class DeribitFetcher implements ExchangeFetcher {
   readonly name = 'Deribit';
 
   async fetchOptions(): Promise<MarketSnapshot> {
+    console.log('========== DERIBIT FETCHER v3 (axios) ==========');
+    console.log('[DeribitFetcher] HTTPS_PROXY:', process.env.HTTPS_PROXY);
     try {
-      // 先获取 index price（更快）
-      const idxRes = await fetch(
+      console.log('[DeribitFetcher] Starting fetch...');
+
+      const idxRes = await axios.get(
         'https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd',
-        { signal: AbortSignal.timeout(15000) }
+        { timeout: 15000 }
       );
-      if (!idxRes.ok) throw new Error('deribit index price failed');
-      const idxData = await idxRes.json();
-      const spot: number = idxData.result?.index_price ?? 0;
+      const spot: number = idxRes.data.result?.index_price ?? 0;
       if (spot <= 0) throw new Error('invalid BTC index price');
+      console.log('[DeribitFetcher] Spot:', spot);
 
-      // 再获取 instruments
-      const instrRes = await fetch(
+      const instrRes = await axios.get(
         'https://www.deribit.com/api/v2/public/get_instruments?currency=BTC&kind=option&expired=false',
-        { signal: AbortSignal.timeout(20000) }
+        { timeout: 20000 }
       );
 
-      if (!instrRes.ok) throw new Error('deribit instruments failed');
-      const instrData = await instrRes.json();
-
-      const allInstruments: any[] = (instrData.result ?? []).filter((i: any) => i.is_active);
+      const allInstruments: any[] = (instrRes.data.result ?? []).filter((i: any) => i.is_active);
+      console.log('[DeribitFetcher] Total instruments:', allInstruments.length);
 
       const byExpiry = new Map<string, any[]>();
       for (const inst of allInstruments) {
@@ -82,6 +82,7 @@ export class DeribitFetcher implements ExchangeFetcher {
           }
         }
       }
+      console.log('[DeribitFetcher] Selected instruments:', selectedInsts.length);
 
       const BATCH_SIZE = 30;
       const tickerMap = new Map<string, any>();
@@ -90,16 +91,17 @@ export class DeribitFetcher implements ExchangeFetcher {
         const batch = selectedInsts.slice(i, i + BATCH_SIZE);
         const results = await Promise.all(
           batch.map(inst =>
-            fetch(
+            axios.get(
               `https://www.deribit.com/api/v2/public/ticker?instrument_name=${inst.instrument_name}`,
-              { signal: AbortSignal.timeout(20000) }
-            ).then(r => r.json()).catch(() => null)
+              { timeout: 20000 }
+            ).then(r => r.data).catch(() => null)
           )
         );
         for (let j = 0; j < batch.length; j++) {
           const res = results[j];
           if (res?.result) tickerMap.set(batch[j].instrument_name, res.result);
         }
+        console.log(`[DeribitFetcher] Batch ${Math.floor(i/BATCH_SIZE)+1} done`);
       }
 
       const contracts: OptionContract[] = [];
@@ -160,6 +162,7 @@ export class DeribitFetcher implements ExchangeFetcher {
         });
       }
 
+      console.log('[DeribitFetcher] Valid contracts:', contracts.length);
       if (contracts.length === 0) throw new Error('no valid contracts parsed');
       return {
         symbol: 'BTC',
@@ -174,9 +177,8 @@ export class DeribitFetcher implements ExchangeFetcher {
       console.warn('[DeribitFetcher] fallback to mock:', e);
       let fallbackSpot = 80000;
       try {
-        const r = await fetch('https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd', { signal: AbortSignal.timeout(3000) });
-        const d = await r.json();
-        fallbackSpot = d.result?.index_price ?? fallbackSpot;
+        const r = await axios.get('https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd', { timeout: 3000 });
+        fallbackSpot = r.data.result?.index_price ?? fallbackSpot;
       } catch { /* ignore */ }
       const snapshot = generateMockSnapshot('BTC', fallbackSpot);
       return { ...snapshot, isMock: true, exchangeId: 'deribit' };

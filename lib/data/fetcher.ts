@@ -12,8 +12,28 @@ function tte(expiry: string): number {
   return Math.max(days, 0) / 365;
 }
 
+function moneyness(strike: number, forward: number, t: number): number {
+  if (t <= 0) return 0;
+  return Math.log(strike / forward) / Math.sqrt(t);
+}
+
+function bsFromIV(S: number, K: number, T: number, r: number, iv: number, isCall: boolean) {
+  const d1 = (Math.log(S / K) + (r + 0.5 * iv * iv) * T) / (iv * Math.sqrt(T));
+  const d2 = d1 - iv * Math.sqrt(T);
+  const normCDF = (x: number) => {
+    const t = 1 / (1 + 0.2316419 * Math.abs(x));
+    const poly = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+    const pdf = Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
+    const cdf = 1 - pdf * poly;
+    return x >= 0 ? cdf : 1 - cdf;
+  };
+  const price = isCall
+    ? S * normCDF(d1) - K * Math.exp(-r * T) * normCDF(d2)
+    : K * Math.exp(-r * T) * normCDF(-d2) - S * normCDF(-d1);
+  return { price: Math.max(price, 0) };
+}
+
 export function generateMockSnapshot(symbol: string, spot: number): MarketSnapshot {
-  console.log('[generateMockSnapshot] Starting with spot:', spot);
   const contracts: OptionContract[] = [];
   const today = new Date();
 
@@ -24,7 +44,7 @@ export function generateMockSnapshot(symbol: string, spot: number): MarketSnapsh
   });
 
   const baseSVI = {
-    a: 0.005, b: 0.15, rho: -0.25, m: 0.0, sigma: 0.15,
+    a: 0.04, b: 0.3, rho: -0.35, m: 0.0, sigma: 0.25,
   };
 
   const anomalySeeds: Set<string> = new Set();
@@ -33,27 +53,6 @@ export function generateMockSnapshot(symbol: string, spot: number): MarketSnapsh
     const ei = Math.floor(Math.random() * expiries.length);
     const ki = Math.floor(Math.random() * 11);
     anomalySeeds.add(`${ei}-${ki}`);
-  }
-
-  function bsFromIV(S: number, K: number, T: number, r: number, iv: number, isCall: boolean) {
-    const normCDF = (x: number) => {
-      const t = 1 / (1 + 0.2316419 * Math.abs(x));
-      const poly = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
-      const pdf = Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
-      const cdf = 1 - pdf * poly;
-      return x >= 0 ? cdf : 1 - cdf;
-    };
-    const d1 = (Math.log(S / K) + (r + 0.5 * iv * iv) * T) / (iv * Math.sqrt(T));
-    const d2 = d1 - iv * Math.sqrt(T);
-    const price = isCall
-      ? S * normCDF(d1) - K * Math.exp(-r * T) * normCDF(d2)
-      : K * Math.exp(-r * T) * normCDF(-d2) - S * normCDF(-d1);
-    return { price: Math.max(price, 0) };
-  }
-
-  function moneyness(strike: number, forward: number, t: number): number {
-    if (t <= 0) return 0;
-    return Math.log(strike / forward) / Math.sqrt(t);
   }
 
   expiries.forEach((expiry, ei) => {
@@ -72,11 +71,6 @@ export function generateMockSnapshot(symbol: string, spot: number): MarketSnapsh
         Math.sqrt((k - baseSVI.m) ** 2 + baseSVI.sigma ** 2)
       );
       let trueIV = Math.sqrt(Math.max(w / t, 0.01));
-
-      // 调试：检查 IV 值
-      if (trueIV > 2.0 || trueIV < 0.1) {
-        console.log(`[generateMockSnapshot] Warning: IV=${trueIV} for t=${t}, w=${w}`);
-      }
 
       const isAnomaly = anomalySeeds.has(`${ei}-${ki}`);
       let anomalyBump = 0;

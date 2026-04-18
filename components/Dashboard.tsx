@@ -24,7 +24,7 @@ interface DetectionParams {
 const DEFAULT_PARAMS: DetectionParams = {
   sigmaMultiplier: 2.0,
   absPctThreshold: 10,
-  smoothLambda: 0.05,
+  smoothLambda: 0.20,
 };
 
 export default function Dashboard() {
@@ -50,6 +50,8 @@ export default function Dashboard() {
     setLoading(true);
     setError(null);
     try {
+      // 直接使用服务器端 API，避免浏览器端 CORS 问题
+      console.log('[Dashboard] Using server-side API for', exchangeId);
       const url = new URL('/api/iv-surface', window.location.origin);
       url.searchParams.set('sigma', String(p.sigmaMultiplier));
       url.searchParams.set('absPct', String(p.absPctThreshold / 100));
@@ -60,13 +62,13 @@ export default function Dashboard() {
         url.searchParams.set('stress', '1');
         url.searchParams.set('stressCount', '5');
       }
-
       const res = await fetch(url.toString());
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error ?? `HTTP ${res.status}`);
       }
       const json: SurfaceResponse = await res.json();
+
       setData(json);
       setStressActive(stress);
       setSelectedPoint(null);
@@ -113,12 +115,15 @@ export default function Dashboard() {
 
   // 交易所切换
   const handleExchangeChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    setExchange(e.target.value as ExchangeId);
+    const newExchange = e.target.value as ExchangeId;
+    setExchange(newExchange);
+    fetchSurface(params, stressMode, newExchange, optionType);
   };
 
   // 期权类型切换
   const handleOptionTypeChange = (type: OptionTypeFilter) => {
     setOptionType(type);
+    fetchSurface(params, stressMode, exchange, type);
   };
 
   const fetchedTime = data?.fetchedAt ? new Date(data.fetchedAt).toLocaleTimeString('zh-CN') : null;
@@ -131,12 +136,58 @@ export default function Dashboard() {
   const anomalies = data?.points.filter(p => p.anomalyType !== 'normal') ?? [];
   const stressInjected = data?.points.filter(p => p.stressInjected) ?? [];
 
-  const sortedByEV = useMemo(() =>
-    [...anomalies]
+  type SortField = 'ev' | 'winProb' | 'expectedProfit' | 'expectedLoss';
+  type SortDirection = 'asc' | 'desc';
+  const [sortField, setSortField] = useState<SortField>('ev');
+  const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
+  const [currentPage, setCurrentPage] = useState(1);
+  const PAGE_SIZE = 10;
+
+  const toggleSort = (field: SortField) => {
+    if (sortField === field) {
+      setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortField(field);
+      setSortDirection('desc');
+    }
+  };
+
+  const sortedByEV = useMemo(() => {
+    const sorted = [...anomalies]
       .filter(p => p.tradeAnalysis)
-      .sort((a, b) => (b.tradeAnalysis!.ev) - (a.tradeAnalysis!.ev)),
-    [anomalies]
-  );
+      .sort((a, b) => {
+        const ta = a.tradeAnalysis!;
+        const tb = b.tradeAnalysis!;
+        let valA: number, valB: number;
+        switch (sortField) {
+          case 'winProb': valA = ta.winProb; valB = tb.winProb; break;
+          case 'expectedProfit': valA = ta.expectedProfit; valB = tb.expectedProfit; break;
+          case 'expectedLoss': valA = ta.expectedLoss; valB = tb.expectedLoss; break;
+          default: valA = ta.ev; valB = tb.ev;
+        }
+        return sortDirection === 'asc' ? valA - valB : valB - valA;
+      });
+    return sorted;
+  }, [anomalies, sortField, sortDirection]);
+
+  const totalPages = Math.ceil(sortedByEV.length / PAGE_SIZE);
+  const currentPageData = useMemo(() => {
+    const start = (currentPage - 1) * PAGE_SIZE;
+    return sortedByEV.slice(start, start + PAGE_SIZE);
+  }, [sortedByEV, currentPage]);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [sortedByEV.length]);
+
+  const SortIcon = ({ field }: { field: SortField }) => {
+    if (sortField !== field) return null;
+    return (
+      <span className="ml-1 inline-block">
+        {sortDirection === 'asc' ? '↑' : '↓'}
+      </span>
+    );
+  };
 
   const handlePointClick = useCallback((pt: IVPoint) => {
     setSelectedPoint(prev => prev?.instrument === pt.instrument ? null : pt);
@@ -433,13 +484,33 @@ export default function Dashboard() {
                 <div className="grid grid-cols-7 gap-0 px-3 py-2 text-xs text-slate-600 border-b border-slate-800 font-medium">
                   <span className="col-span-2">合约</span>
                   <span>方向</span>
-                  <span>胜率</span>
-                  <span>预期盈利</span>
-                  <span>预期亏损</span>
-                  <span className="text-right">净EV</span>
+                  <button
+                    onClick={() => toggleSort('winProb')}
+                    className="text-left hover:text-slate-300 transition-colors"
+                  >
+                    胜率<SortIcon field="winProb" />
+                  </button>
+                  <button
+                    onClick={() => toggleSort('expectedProfit')}
+                    className="text-left hover:text-slate-300 transition-colors"
+                  >
+                    预期盈利<SortIcon field="expectedProfit" />
+                  </button>
+                  <button
+                    onClick={() => toggleSort('expectedLoss')}
+                    className="text-left hover:text-slate-300 transition-colors"
+                  >
+                    预期亏损<SortIcon field="expectedLoss" />
+                  </button>
+                  <button
+                    onClick={() => toggleSort('ev')}
+                    className="text-right hover:text-slate-300 transition-colors"
+                  >
+                    净EV<SortIcon field="ev" />
+                  </button>
                 </div>
                 <div className="divide-y divide-slate-800/60">
-                  {sortedByEV.slice(0, 8).map((p) => {
+                  {currentPageData.map((p) => {
                     const ta = p.tradeAnalysis!;
                     const isO = p.anomalyType === 'overpriced';
                     const isStress = p.stressInjected;
@@ -470,13 +541,39 @@ export default function Dashboard() {
                     );
                   })}
                 </div>
+                {totalPages > 1 && (
+                  <div className="flex items-center justify-between px-3 py-2 border-t border-slate-800">
+                    <div className="text-xs text-slate-500">
+                      共 {sortedByEV.length} 个机会
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                        disabled={currentPage === 1}
+                        className="px-2 py-1 text-xs rounded border border-slate-700 text-slate-400 hover:text-white hover:border-slate-500 disabled:opacity-40 disabled:hover:border-slate-700 disabled:hover:text-slate-400 transition-all"
+                      >
+                        上一页
+                      </button>
+                      <span className="text-xs text-slate-400 px-2">
+                        {currentPage} / {totalPages}
+                      </span>
+                      <button
+                        onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                        disabled={currentPage === totalPages}
+                        className="px-2 py-1 text-xs rounded border border-slate-700 text-slate-400 hover:text-white hover:border-slate-500 disabled:opacity-40 disabled:hover:border-slate-700 disabled:hover:text-slate-400 transition-all"
+                      >
+                        下一页
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           )}
         </div>
 
         {/* ── 右侧 30%：交易分析面板 ── */}
-        <div className="flex flex-col gap-3 min-w-0" style={{ flex: '0 0 30%', maxWidth: '30%' }}>
+        <div className="flex flex-col gap-3 min-w-0 h-full overflow-hidden" style={{ flex: '0 0 30%', maxWidth: '30%' }}>
 
           <div className="flex items-center gap-2">
             <Target size={14} className="text-blue-400" />
@@ -534,7 +631,7 @@ export default function Dashboard() {
             const absPctRule = absDev > params.absPctThreshold && params.absPctThreshold > 0;
 
             return (
-              <div className="flex flex-col gap-3 overflow-y-auto max-h-[calc(100vh-10rem)]
+              <div className="flex-1 flex flex-col gap-3 overflow-y-auto min-h-0
                 pr-0.5 [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-thumb]:bg-slate-700">
 
                 {/* 压力测试提示 */}

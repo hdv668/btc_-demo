@@ -625,20 +625,60 @@ async function computeSurface(
     }
   }
 
-  const RBF_MAX = 120;
-  let rbfPoints = rawPoints;
-  if (rawPoints.length > RBF_MAX) {
-    const step = rawPoints.length / RBF_MAX;
-    rbfPoints = Array.from({ length: RBF_MAX }, (_, i) => rawPoints[Math.round(i * step)]);
+  // 按到期日分组并拟合 SVI
+  const byExpiry = new Map<string, typeof rawPoints>();
+  for (const p of rawPoints) {
+    const key = p.expiry;
+    if (!byExpiry.has(key)) byExpiry.set(key, []);
+    byExpiry.get(key)!.push(p);
   }
 
-  const srcK = rbfPoints.map(p => p.strike);
-  const srcT = rbfPoints.map(p => p.tenor);
-  const srcIV = rbfPoints.map(p => p.iv);
+  // 对每个到期日拟合 SVI
+  const sviParams: Record<string, SVIParams> = {};
+  const F = underlying;
 
-  const qK = rawPoints.map(p => p.strike);
-  const qT = rawPoints.map(p => p.tenor);
-  const ivSurfaceValues = rbfCubicInterpolate(srcK, srcT, srcIV, qK, qT, smoothLambda);
+  for (const [expiry, points] of byExpiry.entries()) {
+    if (points.length < 5) continue;
+    const tte = points[0].tenor;
+    const ks = points.map(p => Math.log(p.strike / F));
+    const ivs = points.map(p => p.iv);
+    const fit = fitSVI(ks, ivs, tte);
+    if (fit) sviParams[expiry] = fit;
+  }
+
+  console.log('[computeSurface] SVI fitted for', Object.keys(sviParams).length, 'expiries');
+
+  // 使用 SVI 计算曲面值（如果 SVI 可用），否则回退到 RBF
+  let ivSurfaceValues: number[];
+  const sviParamsUsed = Object.keys(sviParams).length > 0;
+
+  if (sviParamsUsed) {
+    // 使用 SVI 计算每个点的曲面 IV
+    ivSurfaceValues = rawPoints.map(p => {
+      const fit = sviParams[p.expiry];
+      if (!fit) return p.iv; // 回退到市场 IV
+      const k = Math.log(p.strike / F);
+      const iv = sviIV(k, fit.tte, fit.a, fit.b, fit.rho, fit.m, fit.sigma);
+      return iv ?? p.iv;
+    });
+    console.log('[computeSurface] Using SVI for surface values');
+  } else {
+    // 回退到 RBF，但增加正则化
+    const RBF_MAX = 100;
+    let rbfPoints = rawPoints;
+    if (rawPoints.length > RBF_MAX) {
+      const step = rawPoints.length / RBF_MAX;
+      rbfPoints = Array.from({ length: RBF_MAX }, (_, i) => rawPoints[Math.round(i * step)]);
+    }
+    const srcK = rbfPoints.map(p => p.strike);
+    const srcT = rbfPoints.map(p => p.tenor);
+    const srcIV = rbfPoints.map(p => p.iv);
+    const qK = rawPoints.map(p => p.strike);
+    const qT = rawPoints.map(p => p.tenor);
+    const lambdaRbf = Math.max(smoothLambda, 0.2);
+    ivSurfaceValues = rbfCubicInterpolate(srcK, srcT, srcIV, qK, qT, lambdaRbf);
+    console.log('[computeSurface] Using RBF for surface values (no SVI)');
+  }
 
   const residuals = rawPoints.map((p, i) => p.iv - ivSurfaceValues[i]);
   const meanRes = residuals.reduce((a, b) => a + b, 0) / residuals.length;
@@ -703,6 +743,8 @@ async function computeSurface(
   const overpricedCount = points.filter(p => p.anomalyType === 'overpriced').length;
   const underpricedCount = points.filter(p => p.anomalyType === 'underpriced').length;
 
+  const rndSlices: Record<string, RNDPoint[]> = {};
+
   return {
     points,
     underlyingPrice: underlying,
@@ -714,8 +756,8 @@ async function computeSurface(
     residualSigma: sigma,
     isMock: snapshot.isMock ?? false,
     exchange: exchange,
-    sviParams: {},
-    rndSlices: {},
+    sviParams,
+    rndSlices,
     params: {
       sigmaMultiplier,
       absPctThreshold,

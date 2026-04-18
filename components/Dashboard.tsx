@@ -7,7 +7,10 @@ import {
   BarChart2, Zap, Target, Shield, DollarSign, Percent, ChevronRight,
   Sliders, AlertTriangle, FlaskConical,
 } from 'lucide-react';
-import type { IVPoint, SurfaceResponse, TradeAnalysis } from '@/app/api/iv-surface/route';
+import type { IVPoint, SurfaceResponse, TradeAnalysis, MarketSnapshot } from '@/app/api/iv-surface/route';
+import { fetchBTCOptionsBrowser } from '@/lib/data/exchanges/deribit-browser';
+import { fetchBybitOptionsBrowser } from '@/lib/data/exchanges/bybit-browser';
+import { fetchBinanceOptionsBrowser } from '@/lib/data/exchanges/binance-browser';
 
 type ExchangeId = 'deribit' | 'bybit' | 'binance';
 type OptionTypeFilter = 'call' | 'put' | 'both';
@@ -50,8 +53,54 @@ export default function Dashboard() {
     setLoading(true);
     setError(null);
     try {
-      // 直接使用服务器端 API，避免浏览器端 CORS 问题
-      console.log('[Dashboard] Using server-side API for', exchangeId);
+      // Deribit 和 Bybit 可以在浏览器端直接获取（没有 CORS 限制）
+      if (exchangeId === 'deribit' || exchangeId === 'bybit') {
+        console.log('[Dashboard] Using browser-side fetch for', exchangeId);
+
+        // Step 1: 浏览器端直接获取交易所数据
+        let snapshot: MarketSnapshot;
+        switch (exchangeId) {
+          case 'deribit':
+            snapshot = await fetchBTCOptionsBrowser();
+            break;
+          case 'bybit':
+            snapshot = await fetchBybitOptionsBrowser();
+            break;
+          default:
+            snapshot = await fetchBTCOptionsBrowser();
+        }
+
+        // Step 2: POST 数据到服务器端计算曲面
+        const options = {
+          sigmaMultiplier: p.sigmaMultiplier,
+          absPctThreshold: p.absPctThreshold / 100,
+          smoothLambda: p.smoothLambda,
+          stressMode: stress,
+          stressCount: stress ? 5 : 0,
+          optionType: optType,
+          exchange: exchangeId,
+        };
+
+        const res = await fetch('/api/iv-surface', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ snapshot, options }),
+        });
+
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error ?? `HTTP ${res.status}`);
+        }
+        const json: SurfaceResponse = await res.json();
+
+        setData(json);
+        setStressActive(stress);
+        setSelectedPoint(null);
+        return;
+      }
+
+      // Binance 使用服务器端（会自动 fallback 到 mock，因为有 CORS 限制）
+      console.log('[Dashboard] Using server-side API for Binance');
       const url = new URL('/api/iv-surface', window.location.origin);
       url.searchParams.set('sigma', String(p.sigmaMultiplier));
       url.searchParams.set('absPct', String(p.absPctThreshold / 100));

@@ -3,8 +3,18 @@ import type { ExchangeFetcher } from './types';
 import type { OptionContract, MarketSnapshot } from '@/types';
 import { impliedVol } from '@/lib/engine/blackScholes';
 import { differenceInCalendarDays, parseISO } from 'date-fns';
-import { generateMockSnapshot } from '@/lib/data/fetcher';
+import { generateMockSnapshot } from '@/lib/data/mock-utils';
 import axios from 'axios';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+
+// 使用VPN代理端口59527
+const proxyAgent = new HttpsProxyAgent('http://127.0.0.1:59527');
+const axiosConfig = {
+  httpAgent: proxyAgent,
+  httpsAgent: proxyAgent,
+  proxy: false, // 禁用axios默认的proxy配置
+  timeout: 30000
+};
 
 const RISK_FREE = 0.05;
 
@@ -37,7 +47,7 @@ export class BinanceFetcher implements ExchangeFetcher {
 
       const idxRes = await axios.get(
         'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT',
-        { timeout: 30000 }
+        axiosConfig
       );
       const spot: number = parseFloat(idxRes.data.price ?? 0);
       if (spot <= 0) throw new Error('invalid BTC index price');
@@ -45,10 +55,10 @@ export class BinanceFetcher implements ExchangeFetcher {
 
       const exchInfoRes = await axios.get(
         'https://eapi.binance.com/eapi/v1/exchangeInfo',
-        { timeout: 30000 }
+        axiosConfig
       );
 
-      const allInstruments: any[] = (exchInfoRes.data.symbols ?? []).filter((s: any) =>
+      const allInstruments: any[] = (exchInfoRes.data.optionSymbols ?? exchInfoRes.data.symbols ?? []).filter((s: any) =>
         s.symbol.startsWith('BTC-') && s.status === 'TRADING'
       );
       console.log('[BinanceFetcher] Total instruments:', allInstruments.length);
@@ -76,7 +86,7 @@ export class BinanceFetcher implements ExchangeFetcher {
 
       const tickerRes = await axios.get(
         'https://eapi.binance.com/eapi/v1/ticker',
-        { timeout: 30000 }
+        axiosConfig
       );
 
       const tickerMap = new Map<string, any>();
@@ -149,7 +159,7 @@ export class BinanceFetcher implements ExchangeFetcher {
       console.warn('[BinanceFetcher] fallback to mock:', e);
       let fallbackSpot = 80000;
       try {
-        const r = await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', { timeout: 3000 });
+        const r = await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', { ...axiosConfig, timeout: 3000 });
         fallbackSpot = parseFloat(r.data.price ?? fallbackSpot);
       } catch { /* ignore */ }
       const snapshot = generateMockSnapshot('BTC', fallbackSpot);

@@ -3,7 +3,7 @@
 import type { OptionContract, MarketSnapshot } from '@/types';
 import { impliedVol } from '@/lib/engine/blackScholes';
 import { differenceInCalendarDays, parseISO } from 'date-fns';
-import { generateMockSnapshot } from '@/lib/data/fetcher';
+import { generateMockSnapshot } from '@/lib/data/mock-utils';
 
 const RISK_FREE = 0.05;
 
@@ -117,7 +117,7 @@ export async function fetchBybitOptionsBrowser(): Promise<MarketSnapshot> {
       if (symbolParts.length < 4) continue;
 
       const strike: number = parseFloat(symbolParts[2]);
-      if (isNaN(strike) || strike < spot * 0.4 || strike > spot * 2.0) continue;
+      if (isNaN(strike) || strike < spot * 0.3 || strike > spot * 3.0) continue;
 
       // 转换日期格式: 26MAR27 -> 2027-03-26
       const expiryStr = (() => {
@@ -135,16 +135,16 @@ export async function fetchBybitOptionsBrowser(): Promise<MarketSnapshot> {
         return `${year}-${month}-${day}`;
       })();
       const t = tte(expiryStr);
-      if (t < 1 / 365) continue;
+      if (t < 0 / 365) continue;
 
       const isCall: boolean = inst.optionsType === 'Call';
 
       const iv = impliedVol(midPrice, spot, strike, t, 0, isCall, 0);
-      if (!iv || iv < 0.05 || iv > 5) continue;
+      if (!iv || iv < 0.01 || iv > 10) continue;
 
       const fwd = spot;
       const mono = moneyness(strike, fwd, t);
-      if (Math.abs(mono) > 3) continue;
+      if (Math.abs(mono) > 4) continue;
 
       contracts.push({
         symbol: 'BTC',

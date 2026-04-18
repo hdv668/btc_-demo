@@ -3,7 +3,7 @@ import type { ExchangeFetcher } from './types';
 import type { OptionContract, MarketSnapshot } from '@/types';
 import { impliedVol } from '@/lib/engine/blackScholes';
 import { differenceInCalendarDays, parseISO } from 'date-fns';
-import { generateMockSnapshot } from '@/lib/data/fetcher';
+import { generateMockSnapshot } from '@/lib/data/mock-utils';
 import axios from 'axios';
 
 const RISK_FREE = 0.05;

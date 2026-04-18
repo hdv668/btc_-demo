@@ -9,6 +9,9 @@ import {
 } from 'lucide-react';
 import type { IVPoint, SurfaceResponse, TradeAnalysis } from '@/app/api/iv-surface/route';
 
+type ExchangeId = 'deribit' | 'bybit' | 'binance';
+type OptionTypeFilter = 'call' | 'put' | 'both';
+
 const IVSurface3D = dynamic(() => import('@/components/charts/IVSurface3D'), { ssr: false });
 
 // ─── 检测参数状态 ───
@@ -29,6 +32,8 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedPoint, setSelectedPoint] = useState<IVPoint | null>(null);
+  const [exchange, setExchange] = useState<ExchangeId>('deribit');
+  const [optionType, setOptionType] = useState<OptionTypeFilter>('both');
 
   // 检测参数
   const [params, setParams] = useState<DetectionParams>(DEFAULT_PARAMS);
@@ -41,7 +46,7 @@ export default function Dashboard() {
   const [absPctInput, setAbsPctInput] = useState(String(DEFAULT_PARAMS.absPctThreshold));
   const [lambdaInput, setLambdaInput] = useState(String(DEFAULT_PARAMS.smoothLambda));
 
-  const fetchSurface = useCallback(async (p: DetectionParams, stress: boolean) => {
+  const fetchSurface = useCallback(async (p: DetectionParams, stress: boolean, exchangeId: ExchangeId, optType: OptionTypeFilter) => {
     setLoading(true);
     setError(null);
     try {
@@ -49,6 +54,8 @@ export default function Dashboard() {
       url.searchParams.set('sigma', String(p.sigmaMultiplier));
       url.searchParams.set('absPct', String(p.absPctThreshold / 100));
       url.searchParams.set('smooth', String(p.smoothLambda));
+      url.searchParams.set('exchange', exchangeId);
+      url.searchParams.set('optionType', optType);
       if (stress) {
         url.searchParams.set('stress', '1');
         url.searchParams.set('stressCount', '5');
@@ -70,13 +77,13 @@ export default function Dashboard() {
     }
   }, []);
 
-  useEffect(() => { fetchSurface(params, false); }, [fetchSurface]);
+  useEffect(() => { fetchSurface(params, false, exchange, optionType); }, [fetchSurface, exchange, optionType]);
 
   // σ 滑动条松开后立即刷新
   const handleSigmaChange = (v: number) => {
     const next = { ...params, sigmaMultiplier: v };
     setParams(next);
-    fetchSurface(next, stressMode);
+    fetchSurface(next, stressMode, exchange, optionType);
   };
 
   // 绝对百分比输入框失焦时刷新
@@ -85,7 +92,7 @@ export default function Dashboard() {
     setAbsPctInput(String(v));
     const next = { ...params, absPctThreshold: v };
     setParams(next);
-    fetchSurface(next, stressMode);
+    fetchSurface(next, stressMode, exchange, optionType);
   };
 
   // 平滑因子输入框失焦时刷新
@@ -94,14 +101,24 @@ export default function Dashboard() {
     setLambdaInput(String(v));
     const next = { ...params, smoothLambda: v };
     setParams(next);
-    fetchSurface(next, stressMode);
+    fetchSurface(next, stressMode, exchange, optionType);
   };
 
   // 压力测试按钮
   const handleStressTest = () => {
     const nextStress = !stressMode;
     setStressMode(nextStress);
-    fetchSurface(params, nextStress);
+    fetchSurface(params, nextStress, exchange, optionType);
+  };
+
+  // 交易所切换
+  const handleExchangeChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    setExchange(e.target.value as ExchangeId);
+  };
+
+  // 期权类型切换
+  const handleOptionTypeChange = (type: OptionTypeFilter) => {
+    setOptionType(type);
   };
 
   const fetchedTime = data?.fetchedAt ? new Date(data.fetchedAt).toLocaleTimeString('zh-CN') : null;
@@ -143,9 +160,51 @@ export default function Dashboard() {
           </div>
           <div className="flex-1" />
 
+          {/* 交易所选择器 */}
+          <select
+            value={exchange}
+            onChange={handleExchangeChange}
+            disabled={loading}
+            className="text-xs px-3 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-white focus:border-blue-500 focus:outline-none disabled:opacity-40"
+          >
+            <option value="deribit">Deribit</option>
+            <option value="bybit">Bybit</option>
+            <option value="binance">Binance</option>
+          </select>
+
+          {/* 期权类型切换 */}
+          <div className="flex items-center gap-1 px-1 py-0.5 rounded-lg bg-slate-800 border border-slate-700">
+            {(['both', 'call', 'put'] as const).map((type) => (
+              <button
+                key={type}
+                onClick={() => handleOptionTypeChange(type)}
+                disabled={loading}
+                className={`text-xs px-2 py-1 rounded-md transition-all disabled:opacity-40 font-medium
+                  ${optionType === type
+                    ? 'bg-blue-500 text-white'
+                    : 'text-slate-400 hover:text-white'
+                  }`}
+              >
+                {type === 'both' ? '全部' : type === 'call' ? '看涨' : '看跌'}
+              </button>
+            ))}
+          </div>
+
+          {/* 数据源指示器 */}
+          {data && (
+            <div className={`flex items-center gap-1.5 text-xs px-2 py-1 rounded-lg border
+              ${data.isMock
+                ? 'bg-amber-950/30 border-amber-800/30 text-amber-400'
+                : 'bg-emerald-950/30 border-emerald-800/30 text-emerald-400'
+              }`}
+            >
+              {data.isMock ? <FlaskConical size={10} /> : <Wifi size={10} />}
+              <span>{data.isMock ? 'Mock 数据' : 'Real-time'}</span>
+            </div>
+          )}
+
           {data && !loading && (
             <div className="hidden sm:flex items-center gap-1.5 text-xs text-slate-400">
-              <Wifi size={11} className="text-emerald-400" />
               <span>{data.count} 合约 · {expiryCount} 个到期</span>
               <span className="text-slate-700">·</span>
               <span>{params.sigmaMultiplier}σ={sigPct}%</span>
@@ -167,7 +226,7 @@ export default function Dashboard() {
             </div>
           )}
 
-          <button onClick={() => fetchSurface(params, stressMode)} disabled={loading}
+          <button onClick={() => fetchSurface(params, stressMode, exchange, optionType)} disabled={loading}
             className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-white px-3 py-1.5 rounded-lg border border-slate-700 hover:border-slate-500 transition-all disabled:opacity-50 flex-shrink-0">
             <RefreshCw size={11} className={loading ? 'animate-spin' : ''} />
             <span className="hidden sm:block">{loading ? '加载中…' : '刷新'}</span>
@@ -283,7 +342,7 @@ export default function Dashboard() {
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
             <StatCard label="BTC 现货价"
               value={`$${data.underlyingPrice.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
-              sub="Deribit 报价" color="text-white" />
+              sub={`${exchange.charAt(0).toUpperCase() + exchange.slice(1)} 报价`} color="text-white" />
             <StatCard label="IV 区间"
               value={ivMin != null ? `${ivMin.toFixed(0)}%–${ivMax!.toFixed(0)}%` : '—'}
               sub={`${params.sigmaMultiplier}σ 阈值 ±${sigPct}%`} color="text-sky-400" />
@@ -313,7 +372,7 @@ export default function Dashboard() {
             {loading && (
               <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 bg-slate-950/85 rounded-2xl">
                 <div className="w-10 h-10 border-2 border-blue-500/30 border-t-blue-500 rounded-full animate-spin" />
-                <div className="text-sm text-slate-400">正在获取 Deribit 期权数据并计算 IV 基准曲面…</div>
+                <div className="text-sm text-slate-400">正在获取 {exchange.charAt(0).toUpperCase() + exchange.slice(1)} 期权数据并计算 IV 基准曲面…</div>
                 <div className="text-xs text-slate-600">
                   Newton-Raphson · 正则化 RBF (λ={params.smoothLambda}) · {params.sigmaMultiplier}σ+{params.absPctThreshold}% 双判定
                 </div>
@@ -323,7 +382,7 @@ export default function Dashboard() {
               <div className="flex-1 flex flex-col items-center justify-center gap-3 text-slate-400">
                 <WifiOff size={28} className="text-slate-600" />
                 <div className="text-sm text-red-400">{error}</div>
-                <button onClick={() => fetchSurface(params, stressMode)}
+                <button onClick={() => fetchSurface(params, stressMode, exchange, optionType)}
                   className="text-xs px-4 py-2 rounded-lg border border-slate-700 hover:border-blue-500 hover:text-blue-400 transition-all">
                   重试
                 </button>

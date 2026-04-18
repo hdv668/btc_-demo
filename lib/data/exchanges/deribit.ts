@@ -31,6 +31,11 @@ function parseDeribitExpiry(raw: string): string | null {
   return `${year}-${mon}-${day}`;
 }
 
+export async function fetchBTCOptions(): Promise<MarketSnapshot> {
+  const fetcher = new DeribitFetcher();
+  return fetcher.fetchOptions();
+}
+
 export class DeribitFetcher implements ExchangeFetcher {
   readonly id = 'deribit' as const;
   readonly name = 'Deribit';

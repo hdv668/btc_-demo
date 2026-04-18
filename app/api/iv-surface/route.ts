@@ -585,6 +585,7 @@ export async function GET(req: NextRequest) {
     }
 
     const rawPoints: RawPoint[] = contracts
+      .filter(c => c.impliedVol != null)
       .map(c => {
         // 从合约构造 instrument_name（用于兼容）
         const expiryParts = c.expiry.split('-');
@@ -598,14 +599,15 @@ export async function GET(req: NextRequest) {
         // 估算 BTC 计价的 bid/ask（原代码需要）
         const bidPriceBtc = c.bid / c.underlyingPrice;
         const askPriceBtc = c.ask / c.underlyingPrice;
+        const iv = c.impliedVol!;
 
         return {
           instrument: instrumentName,
           strike: c.strike,
           tenor: c.tte,
-          iv: c.impliedVol,
-          ivBid: c.impliedVol * 0.98, // 模拟 bid IV
-          ivAsk: c.impliedVol * 1.02, // 模拟 ask IV
+          iv: iv,
+          ivBid: iv * 0.98, // 模拟 bid IV
+          ivAsk: iv * 1.02, // 模拟 ask IV
           bidPrice: bidPriceBtc,
           askPrice: askPriceBtc,
           expiry: `${dd}${mm}${yy}`,

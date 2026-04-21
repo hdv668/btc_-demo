@@ -1,36 +1,57 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# BTC 期权 IV 曲面分析系统
 
-## Getting Started
+一个专业的 BTC 期权隐含波动率（IV）曲面分析与可视化系统。
 
-First, run the development server:
+## 功能特性
+
+- 📊 **3D IV 曲面可视化** - 实时展示 BTC 期权隐含波动率曲面
+- 📈 **SVI 参数拟合** - 使用 SVI 模型拟合波动率微笑
+- 🔍 **异常检测** - 自动识别被高估或低估的期权合约
+- 🎯 **交易信号** - 基于统计偏差的交易机会分析
+- 🌐 **代理支持** - 支持 HTTP 代理配置，解决网络访问限制
+
+## 快速开始
+
+首先，运行开发服务器：
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+打开 [http://localhost:3000](http://localhost:3000) 查看应用。
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## 代理配置
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+如果无法直接访问 Deribit API（如中国大陆地区），可以配置代理：
 
-## Learn More
+1. 点击页面右上角的 **"代理"** 按钮
+2. 勾选 **"启用代理"**
+3. 输入代理地址（默认：`127.0.0.1`）
+4. 输入代理端口（常用端口：7890、1080、59526、59527）
+5. 点击 **"保存并刷新"**
 
-To learn more about Next.js, take a look at the following resources:
+代理配置会自动保存到浏览器本地存储，下次访问时自动加载。
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## 技术栈
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+- **框架**: Next.js 16 + React 19
+- **可视化**: Plotly.js + Recharts
+- **量化计算**: Black-Scholes, SVI, RBF 插值
+- **数据源**: Deribit API (BTC 期权)
+- **HTTP 客户端**: Axios + https-proxy-agent
 
-## Deploy on Vercel
+## 更新日志
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+### v0.1.1 (2026-04-21)
+- 🌐 **新增**: 代理配置功能，支持 HTTP 代理
+- 🎨 **UI**: 添加代理设置弹窗，支持地址/端口配置
+- 💾 **持久化**: 代理设置自动保存到 localStorage
+- 🔧 **优化**: API 路由支持通过代理请求 Deribit
+- 📝 **改进**: 常用端口列表增加 59526，移除端口自动修正
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+### v0.1.0 (2026-04-18)
+- 🎉 **初始版本**: BTC 期权 IV 曲面分析系统完整代码
+
+## License
+
+MIT

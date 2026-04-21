@@ -5,9 +5,10 @@ import dynamic from 'next/dynamic';
 import {
   Activity, RefreshCw, Wifi, WifiOff, TrendingUp, TrendingDown,
   BarChart2, Zap, Target, Shield, DollarSign, Percent, ChevronRight,
-  Sliders, AlertTriangle, FlaskConical,
+  Sliders, AlertTriangle, FlaskConical, Settings,
 } from 'lucide-react';
 import type { IVPoint, SurfaceResponse, TradeAnalysis } from '@/app/api/iv-surface/route';
+import { ProxySettingsModal, useProxySettings } from '@/components/ProxySettings';
 
 const IVSurface3D = dynamic(() => import('@/components/charts/IVSurface3D'), { ssr: false });
 
@@ -29,6 +30,8 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedPoint, setSelectedPoint] = useState<IVPoint | null>(null);
+  const [showProxySettings, setShowProxySettings] = useState(false);
+  const { getProxyUrl } = useProxySettings();
 
   // 检测参数
   const [params, setParams] = useState<DetectionParams>(DEFAULT_PARAMS);
@@ -54,7 +57,22 @@ export default function Dashboard() {
         url.searchParams.set('stressCount', '5');
       }
 
-      const res = await fetch(url.toString());
+      const headers: Record<string, string> = {};
+
+      // 直接从 localStorage 读取，避免状态同步问题
+      try {
+        const saved = localStorage.getItem('btc-iv-proxy-settings');
+        if (saved) {
+          const settings = JSON.parse(saved);
+          if (settings.enabled) {
+            headers['x-proxy-url'] = `http://${settings.host}:${settings.port}`;
+          }
+        }
+      } catch (e) {
+        // 静默失败
+      }
+
+      const res = await fetch(url.toString(), { headers });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error ?? `HTTP ${res.status}`);
@@ -166,6 +184,14 @@ export default function Dashboard() {
               <WifiOff size={11} /><span className="hidden sm:block">连接失败</span>
             </div>
           )}
+
+          <button
+            onClick={() => setShowProxySettings(true)}
+            className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-white px-3 py-1.5 rounded-lg border border-slate-700 hover:border-slate-500 transition-all flex-shrink-0"
+          >
+            <Settings size={11} />
+            <span className="hidden sm:block">代理</span>
+          </button>
 
           <button onClick={() => fetchSurface(params, stressMode)} disabled={loading}
             className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-white px-3 py-1.5 rounded-lg border border-slate-700 hover:border-slate-500 transition-all disabled:opacity-50 flex-shrink-0">
@@ -646,6 +672,12 @@ export default function Dashboard() {
           )}
         </div>
       </div>
+
+      {/* 代理设置弹窗 */}
+      <ProxySettingsModal
+        isOpen={showProxySettings}
+        onClose={() => setShowProxySettings(false)}
+      />
     </div>
   );
 }

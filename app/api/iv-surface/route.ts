@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import axios from 'axios';
 
 // ─────────────────────────────────────────────
 //  1. Black-Scholes 正向定价 (The Forward Model)
@@ -458,21 +460,37 @@ function calcPnL(
 // ─────────────────────────────────────────────
 //  Deribit 数据拉取
 // ─────────────────────────────────────────────
-async function fetchDeribitOptions(): Promise<{ result: any[]; indexPrice: number; fetchedAt: number }> {
+async function fetchDeribitOptions(proxyUrl: string | null = null): Promise<{ result: any[]; indexPrice: number; fetchedAt: number }> {
   const fetchedAt = Date.now();
+
+  const axiosConfig: any = {
+    timeout: 20000,
+  };
+
+  // 如果有代理配置，使用 https-proxy-agent
+  if (proxyUrl && typeof process !== 'undefined' && process.versions?.node) {
+    const agent = new HttpsProxyAgent(proxyUrl);
+    axiosConfig.httpAgent = agent;
+    axiosConfig.httpsAgent = agent;
+    axiosConfig.proxy = false;
+  }
+
   // 并发：合约摘要 + 指数价格（独立接口，避免 underlying_price 取到过期缓存值）
   const [bookRes, idxRes] = await Promise.all([
-    fetch(
+    axios.get(
       'https://deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option',
-      { next: { revalidate: 0 } }
+      axiosConfig
     ),
-    fetch(
+    axios.get(
       'https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd',
-      { next: { revalidate: 0 }, signal: AbortSignal.timeout(8000) }
+      axiosConfig
     ),
   ]);
-  if (!bookRes.ok) throw new Error(`Deribit book_summary error: ${bookRes.status}`);
-  const [bookJson, idxJson] = await Promise.all([bookRes.json(), idxRes.json()]);
+
+  const bookJson = bookRes.data;
+  const idxJson = idxRes.data;
+
+  if (bookRes.status !== 200) throw new Error(`Deribit book_summary error: ${bookRes.status}`);
   const indexPrice: number = idxJson.result?.index_price ?? 0;
   return { result: bookJson.result ?? [], indexPrice, fetchedAt };
 }
@@ -543,6 +561,9 @@ export interface SurfaceResponse {
 
 export async function GET(req: NextRequest) {
   try {
+    // ── 解析代理配置 ──
+    const proxyUrl = req.headers.get('x-proxy-url') || null;
+
     // ── 解析查询参数 ──
     const sp = req.nextUrl.searchParams;
 
@@ -559,7 +580,7 @@ export async function GET(req: NextRequest) {
     const stressMode = sp.get('stress') === '1';
     const stressCount = Math.min(10, Math.max(1, parseInt(sp.get('stressCount') ?? '5')));
 
-    const { result: raw, indexPrice, fetchedAt: windowTs } = await fetchDeribitOptions();
+    const { result: raw, indexPrice, fetchedAt: windowTs } = await fetchDeribitOptions(proxyUrl);
     const r = 0.0;
 
     interface RawPoint {

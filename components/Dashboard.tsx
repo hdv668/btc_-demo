@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import dynamic from 'next/dynamic';
 import {
   Activity, RefreshCw, Wifi, WifiOff, TrendingUp, TrendingDown,
@@ -19,6 +19,8 @@ interface DetectionParams {
   smoothLambda: number;      // 0 ~ 0.5（平滑因子）
 }
 
+type Exchange = 'deribit' | 'bybit';
+
 const DEFAULT_PARAMS: DetectionParams = {
   sigmaMultiplier: 2.0,
   absPctThreshold: 10,
@@ -31,7 +33,14 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [selectedPoint, setSelectedPoint] = useState<IVPoint | null>(null);
   const [showProxySettings, setShowProxySettings] = useState(false);
+  const [exchange, setExchange] = useState<Exchange>('deribit');
   const { getProxyUrl } = useProxySettings();
+
+  // 高价值机会清单 - 分页和排序
+  const [currentPage, setCurrentPage] = useState(1);
+  const [sortField, setSortField] = useState<'direction' | 'winProb' | 'expectedProfit' | 'expectedLoss' | 'ev'>('ev');
+  const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
+  const itemsPerPage = 10;
 
   // 检测参数
   const [params, setParams] = useState<DetectionParams>(DEFAULT_PARAMS);
@@ -44,7 +53,8 @@ export default function Dashboard() {
   const [absPctInput, setAbsPctInput] = useState(String(DEFAULT_PARAMS.absPctThreshold));
   const [lambdaInput, setLambdaInput] = useState(String(DEFAULT_PARAMS.smoothLambda));
 
-  const fetchSurface = useCallback(async (p: DetectionParams, stress: boolean) => {
+  // 不使用 useCallback，避免闭包问题
+  const fetchSurface = async (p: DetectionParams, stress: boolean, exchangeId?: Exchange) => {
     setLoading(true);
     setError(null);
     try {
@@ -52,6 +62,7 @@ export default function Dashboard() {
       url.searchParams.set('sigma', String(p.sigmaMultiplier));
       url.searchParams.set('absPct', String(p.absPctThreshold / 100));
       url.searchParams.set('smooth', String(p.smoothLambda));
+      url.searchParams.set('exchange', exchangeId || exchange);
       if (stress) {
         url.searchParams.set('stress', '1');
         url.searchParams.set('stressCount', '5');
@@ -86,9 +97,24 @@ export default function Dashboard() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  };
 
-  useEffect(() => { fetchSurface(params, false); }, [fetchSurface]);
+  const handleExchangeChange = (newExchange: Exchange) => {
+    setExchange(newExchange);
+    fetchSurface(params, stressMode, newExchange);
+  };
+
+  // 使用 ref 跟踪是否是首次加载
+  const isFirstLoad = useRef(true);
+
+  useEffect(() => {
+    if (isFirstLoad.current) {
+      isFirstLoad.current = false;
+      fetchSurface(params, false, exchange);
+    } else {
+      fetchSurface(params, false, exchange);
+    }
+  }, [params, stressMode, exchange]);
 
   // σ 滑动条松开后立即刷新
   const handleSigmaChange = (v: number) => {
@@ -132,12 +158,54 @@ export default function Dashboard() {
   const anomalies = data?.points.filter(p => p.anomalyType !== 'normal') ?? [];
   const stressInjected = data?.points.filter(p => p.stressInjected) ?? [];
 
-  const sortedByEV = useMemo(() =>
-    [...anomalies]
-      .filter(p => p.tradeAnalysis)
-      .sort((a, b) => (b.tradeAnalysis!.ev) - (a.tradeAnalysis!.ev)),
-    [anomalies]
-  );
+  // 高价值机会清单 - 排序和分页
+  const sortedAndPaginatedSignals = useMemo(() => {
+    const signals = [...anomalies].filter(p => p.tradeAnalysis);
+
+    // 排序
+    const sorted = [...signals].sort((a, b) => {
+      const ta = a.tradeAnalysis!;
+      const tb = b.tradeAnalysis!;
+
+      let valA: number, valB: number;
+      switch (sortField) {
+        case 'direction':
+          valA = a.anomalyType === 'overpriced' ? 1 : -1;
+          valB = b.anomalyType === 'overpriced' ? 1 : -1;
+          break;
+        case 'winProb':
+          valA = ta.winProb;
+          valB = tb.winProb;
+          break;
+        case 'expectedProfit':
+          valA = ta.expectedProfit;
+          valB = tb.expectedProfit;
+          break;
+        case 'expectedLoss':
+          valA = ta.expectedLoss;
+          valB = tb.expectedLoss;
+          break;
+        case 'ev':
+        default:
+          valA = ta.ev;
+          valB = tb.ev;
+          break;
+      }
+
+      return sortDirection === 'desc' ? valB - valA : valA - valB;
+    });
+
+    // 分页
+    const start = (currentPage - 1) * itemsPerPage;
+    const end = start + itemsPerPage;
+
+    return {
+      all: sorted,
+      page: sorted.slice(start, end),
+      totalPages: Math.ceil(sorted.length / itemsPerPage),
+      totalCount: sorted.length,
+    };
+  }, [anomalies, sortField, sortDirection, currentPage]);
 
   const handlePointClick = useCallback((pt: IVPoint) => {
     setSelectedPoint(prev => prev?.instrument === pt.instrument ? null : pt);
@@ -184,6 +252,21 @@ export default function Dashboard() {
               <WifiOff size={11} /><span className="hidden sm:block">连接失败</span>
             </div>
           )}
+
+          <div className="relative flex-shrink-0">
+            <select
+              value={exchange}
+              onChange={(e) => handleExchangeChange(e.target.value as Exchange)}
+              disabled={loading}
+              className="appearance-none bg-slate-900 border border-slate-700 hover:border-slate-500 text-xs text-slate-200 px-3 py-1.5 pr-8 rounded-lg cursor-pointer focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <option value="deribit">Deribit</option>
+              <option value="bybit">Bybit</option>
+            </select>
+            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-slate-400">
+              <ChevronRight size={10} className="rotate-90" />
+            </div>
+          </div>
 
           <button
             onClick={() => setShowProxySettings(true)}
@@ -309,7 +392,7 @@ export default function Dashboard() {
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
             <StatCard label="BTC 现货价"
               value={`$${data.underlyingPrice.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
-              sub="Deribit 报价" color="text-white" />
+              sub={`${exchange.charAt(0).toUpperCase() + exchange.slice(1)} 报价`} color="text-white" />
             <StatCard label="IV 区间"
               value={ivMin != null ? `${ivMin.toFixed(0)}%–${ivMax!.toFixed(0)}%` : '—'}
               sub={`${params.sigmaMultiplier}σ 阈值 ±${sigPct}%`} color="text-sky-400" />
@@ -364,6 +447,7 @@ export default function Dashboard() {
                   selectedInstrument={selectedPoint?.instrument}
                   sviParams={data.sviParams}
                   rndSlices={data.rndSlices}
+                  exchange={exchange}
                 />
               </div>
             )}
@@ -383,13 +467,15 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* ── 底部：高价值机会清单（按 EV 排序）── */}
-          {sortedByEV.length > 0 && (
+          {/* ── 底部：高价值机会清单（分页 + 排序）── */}
+          {sortedAndPaginatedSignals.totalCount > 0 && (
             <div className="mt-4">
               <div className="flex items-center gap-2 mb-2">
                 <Zap size={13} className="text-yellow-400" />
                 <span className="text-sm font-semibold text-white">高价值机会清单</span>
-                <span className="text-xs text-slate-500">按净期望值 EV 排序</span>
+                <span className="text-xs text-slate-500">
+                  共 {sortedAndPaginatedSignals.totalCount} 个 · 第 {currentPage}/{sortedAndPaginatedSignals.totalPages} 页
+                </span>
                 {stressActive && (
                   <span className="text-xs text-orange-400/70 ml-1">
                     · 🔬 压力测试模式（{stressInjected.filter(p => p.anomalyType !== 'normal').length} 个扰动点被捕获）
@@ -397,16 +483,88 @@ export default function Dashboard() {
                 )}
               </div>
               <div className="rounded-xl border border-slate-800 bg-slate-900/40 overflow-hidden">
-                <div className="grid grid-cols-7 gap-0 px-3 py-2 text-xs text-slate-600 border-b border-slate-800 font-medium">
-                  <span className="col-span-2">合约</span>
-                  <span>方向</span>
-                  <span>胜率</span>
-                  <span>预期盈利</span>
-                  <span>预期亏损</span>
-                  <span className="text-right">净EV</span>
+                {/* 可点击排序的表头 */}
+                <div className="grid grid-cols-7 gap-0 px-3 py-2 text-xs border-b border-slate-800">
+                  <span className="col-span-2 text-slate-600 font-medium">合约</span>
+                  <SortableHeader
+                    label="方向"
+                    field="direction"
+                    currentField={sortField}
+                    direction={sortDirection}
+                    onClick={(field) => {
+                      if (sortField === field) {
+                        setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc');
+                      } else {
+                        setSortField(field as any);
+                        setSortDirection('desc');
+                      }
+                      setCurrentPage(1);
+                    }}
+                  />
+                  <SortableHeader
+                    label="胜率"
+                    field="winProb"
+                    currentField={sortField}
+                    direction={sortDirection}
+                    onClick={(field) => {
+                      if (sortField === field) {
+                        setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc');
+                      } else {
+                        setSortField(field as any);
+                        setSortDirection('desc');
+                      }
+                      setCurrentPage(1);
+                    }}
+                  />
+                  <SortableHeader
+                    label="预期盈利"
+                    field="expectedProfit"
+                    currentField={sortField}
+                    direction={sortDirection}
+                    onClick={(field) => {
+                      if (sortField === field) {
+                        setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc');
+                      } else {
+                        setSortField(field as any);
+                        setSortDirection('desc');
+                      }
+                      setCurrentPage(1);
+                    }}
+                  />
+                  <SortableHeader
+                    label="预期亏损"
+                    field="expectedLoss"
+                    currentField={sortField}
+                    direction={sortDirection}
+                    onClick={(field) => {
+                      if (sortField === field) {
+                        setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc');
+                      } else {
+                        setSortField(field as any);
+                        setSortDirection('desc');
+                      }
+                      setCurrentPage(1);
+                    }}
+                  />
+                  <SortableHeader
+                    label="净EV"
+                    field="ev"
+                    currentField={sortField}
+                    direction={sortDirection}
+                    isRightAligned
+                    onClick={(field) => {
+                      if (sortField === field) {
+                        setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc');
+                      } else {
+                        setSortField(field as any);
+                        setSortDirection('desc');
+                      }
+                      setCurrentPage(1);
+                    }}
+                  />
                 </div>
                 <div className="divide-y divide-slate-800/60">
-                  {sortedByEV.slice(0, 8).map((p) => {
+                  {sortedAndPaginatedSignals.page.map((p) => {
                     const ta = p.tradeAnalysis!;
                     const isO = p.anomalyType === 'overpriced';
                     const isStress = p.stressInjected;
@@ -437,6 +595,29 @@ export default function Dashboard() {
                     );
                   })}
                 </div>
+
+                {/* 分页控件 */}
+                {sortedAndPaginatedSignals.totalPages > 1 && (
+                  <div className="flex items-center justify-between px-3 py-2 border-t border-slate-800">
+                    <button
+                      onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                      disabled={currentPage === 1}
+                      className="px-3 py-1 text-xs rounded bg-slate-800 text-slate-400 hover:text-white hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                    >
+                      上一页
+                    </button>
+                    <span className="text-xs text-slate-500">
+                      第 {currentPage} 页，共 {sortedAndPaginatedSignals.totalPages} 页
+                    </span>
+                    <button
+                      onClick={() => setCurrentPage(p => Math.min(sortedAndPaginatedSignals.totalPages, p + 1))}
+                      disabled={currentPage === sortedAndPaginatedSignals.totalPages}
+                      className="px-3 py-1 text-xs rounded bg-slate-800 text-slate-400 hover:text-white hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                    >
+                      下一页
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -501,7 +682,7 @@ export default function Dashboard() {
             const absPctRule = absDev > params.absPctThreshold && params.absPctThreshold > 0;
 
             return (
-              <div className="flex flex-col gap-3 overflow-y-auto max-h-[calc(100vh-10rem)]
+              <div className="flex flex-col gap-3 overflow-y-auto flex-1 min-h-0
                 pr-0.5 [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-thumb]:bg-slate-700">
 
                 {/* 压力测试提示 */}
@@ -738,5 +919,39 @@ function StatCard({
       <div className={`text-xl font-bold ${color}`}>{value}</div>
       <div className="text-xs text-slate-600 mt-0.5">{sub}</div>
     </div>
+  );
+}
+
+// ─── 可排序表头 ───
+function SortableHeader({
+  label,
+  field,
+  currentField,
+  direction,
+  onClick,
+  isRightAligned = false,
+}: {
+  label: string;
+  field: string;
+  currentField: string;
+  direction: 'asc' | 'desc';
+  onClick: (field: string) => void;
+  isRightAligned?: boolean;
+}) {
+  const isActive = currentField === field;
+  return (
+    <button
+      onClick={() => onClick(field)}
+      className={`text-xs font-medium transition-colors hover:text-white flex items-center gap-1
+        ${isActive ? 'text-slate-200' : 'text-slate-500'}
+        ${isRightAligned ? 'justify-self-end' : ''}`}
+    >
+      <span>{label}</span>
+      {isActive && (
+        <span className="text-slate-400">
+          {direction === 'desc' ? '↓' : '↑'}
+        </span>
+      )}
+    </button>
   );
 }

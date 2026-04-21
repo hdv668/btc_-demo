@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import axios from 'axios';
+import { getExchangeAdapter } from '@/app/api/exchanges';
 
 // ─────────────────────────────────────────────
 //  1. Black-Scholes 正向定价 (The Forward Model)
@@ -567,6 +568,10 @@ export async function GET(req: NextRequest) {
     // ── 解析查询参数 ──
     const sp = req.nextUrl.searchParams;
 
+    // 交易所选择
+    const exchange = (sp.get('exchange') ?? 'deribit') as string;
+    const adapter = getExchangeAdapter(exchange);
+
     // 灵敏度：σ 倍数，默认 2.0，范围 0.5–3.0
     const sigmaMultiplier = Math.min(3.0, Math.max(0.5, parseFloat(sp.get('sigma') ?? '2.0')));
 
@@ -580,7 +585,7 @@ export async function GET(req: NextRequest) {
     const stressMode = sp.get('stress') === '1';
     const stressCount = Math.min(10, Math.max(1, parseInt(sp.get('stressCount') ?? '5')));
 
-    const { result: raw, indexPrice, fetchedAt: windowTs } = await fetchDeribitOptions(proxyUrl);
+    const { result: raw, indexPrice, fetchedAt: windowTs } = await adapter.fetchOptions(proxyUrl);
     const r = 0.0;
 
     interface RawPoint {
@@ -597,7 +602,7 @@ export async function GET(req: NextRequest) {
       S: number;
     }
 
-    // 使用独立 get_index_price 接口的实时价格，不依赖合约数据里的 underlying_price
+    // 使用独立获取的指数价格
     const underlying = indexPrice > 0
       ? indexPrice
       : (raw.find((x: any) => x.underlying_price)?.underlying_price ?? 0);
@@ -605,41 +610,33 @@ export async function GET(req: NextRequest) {
 
     for (const item of raw) {
       const name: string = item.instrument_name ?? '';
-      const parts = name.split('-');
-      if (parts.length !== 4) continue;
-      const [, expiryStr, strikeStr, optType] = parts;
-      if (optType !== 'C') continue;
+      const parsed = adapter.parseInstrumentName(name);
+      if (!parsed) continue;
+      const { expiryStr, strike, optionType } = parsed;
+      if (optionType !== 'C') continue;
 
       const bid: number = item.bid_price;
       const ask: number = item.ask_price;
-      // 统一用独立获取的 index_price，不用合约里的 underlying_price（可能过期）
       const S: number = underlying;
       if (!bid || !ask || bid <= 0 || ask <= 0 || !S) continue;
 
-      const strike = parseFloat(strikeStr);
-
-      let expiry: Date;
-      try {
-        expiry = new Date(`${expiryStr.slice(0, -2)} 20${expiryStr.slice(-2)} 08:00:00 UTC`);
-        if (isNaN(expiry.getTime())) {
-          const months: Record<string, number> = {
-            JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5,
-            JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11,
-          };
-          const day = parseInt(expiryStr.replace(/[A-Z]/g, ''));
-          const monStr = expiryStr.slice(-5, -2).toUpperCase();
-          const yr = 2000 + parseInt(expiryStr.slice(-2));
-          expiry = new Date(Date.UTC(yr, months[monStr], day, 8, 0, 0));
-        }
-      } catch { continue; }
-      if (isNaN(expiry.getTime())) continue;
+      const expiry = adapter.parseExpiry(expiryStr, windowTs);
+      if (!expiry) continue;
 
       const T = (expiry.getTime() - windowTs) / (365 * 24 * 3600 * 1000);
       if (T <= 1 / 365) continue;
 
-      const midUsd = ((bid + ask) / 2) * S;
-      const bidUsd = bid * S;
-      const askUsd = ask * S;
+      // 根据交易所价格单位处理：Deribit 价格以 BTC 计价，Bybit 以 USD 计价
+      let midUsd: number, bidUsd: number, askUsd: number;
+      if (adapter.priceInBTC) {
+        midUsd = ((bid + ask) / 2) * S;
+        bidUsd = bid * S;
+        askUsd = ask * S;
+      } else {
+        midUsd = (bid + ask) / 2;
+        bidUsd = bid;
+        askUsd = ask;
+      }
 
       const iv = impliedVolatility(S, strike, T, r, midUsd);
       const ivBid = impliedVolatility(S, strike, T, r, bidUsd);

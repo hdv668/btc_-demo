@@ -14,6 +14,7 @@ interface Props {
   // sviParams/rndSlices 保留兼容性，但不再从外部传入（由组件内部懒加载）
   sviParams?: Record<string, SVIParams>;
   rndSlices?: Record<string, RNDPoint[]>;
+  exchange?: string;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -83,7 +84,7 @@ function linspace(start: number, end: number, n: number): number[] {
 }
 
 export default function IVSurface3D({
-  points, sigmaThreshold, onPointClick, selectedInstrument,
+  points, sigmaThreshold, onPointClick, selectedInstrument, exchange = 'deribit',
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [mode, setMode] = useState<SurfaceMode>('iv');
@@ -98,7 +99,25 @@ export default function IVSurface3D({
     setRndLoading(true);
     setRndError(null);
     try {
-      const res = await fetch('/api/rnd-surface');
+      const headers: Record<string, string> = {};
+
+      // 直接从 localStorage 读取，避免状态同步问题
+      try {
+        const saved = localStorage.getItem('btc-iv-proxy-settings');
+        if (saved) {
+          const settings = JSON.parse(saved);
+          if (settings.enabled) {
+            headers['x-proxy-url'] = `http://${settings.host}:${settings.port}`;
+          }
+        }
+      } catch (e) {
+        // 静默失败
+      }
+
+      const url = new URL('/api/rnd-surface', window.location.origin);
+      url.searchParams.set('exchange', exchange);
+
+      const res = await fetch(url.toString(), { headers });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: RNDResponse = await res.json();
       setRndSlices(data.rndSlices);
@@ -107,7 +126,7 @@ export default function IVSurface3D({
     } finally {
       setRndLoading(false);
     }
-  }, [rndSlices, rndLoading]);
+  }, [rndSlices, rndLoading, exchange]);
 
   const handleClickRND = useCallback(() => {
     setMode('rnd');

@@ -1,4 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import axios from 'axios';
+import { getExchangeAdapter } from '@/app/api/exchanges';
 
 // ─── Black-Scholes 工具函数 ───────────────────────────────────────────────────
 
@@ -219,16 +222,6 @@ function computeRNDSlice(
 
 // ─── Deribit 数据拉取 ─────────────────────────────────────────────────────────
 
-async function fetchDeribitOptions(): Promise<{ result: any[]; indexPrice: number; fetchedAt: number }> {
-  const fetchedAt = Date.now();
-  const [bookRes, idxRes] = await Promise.all([
-    fetch('https://deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option', { next: { revalidate: 0 } }),
-    fetch('https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd', { next: { revalidate: 0 }, signal: AbortSignal.timeout(8000) }),
-  ]);
-  if (!bookRes.ok) throw new Error(`Deribit error: ${bookRes.status}`);
-  const [bookJson, idxJson] = await Promise.all([bookRes.json(), idxRes.json()]);
-  return { result: bookJson.result ?? [], indexPrice: idxJson.result?.index_price ?? 0, fetchedAt };
-}
 
 // ─── 接口响应类型 ─────────────────────────────────────────────────────────────
 
@@ -246,9 +239,17 @@ export interface RNDResponse {
 
 // ─── GET /api/rnd-surface ─────────────────────────────────────────────────────
 
-export async function GET(_req: NextRequest) {
+export async function GET(req: NextRequest) {
   try {
-    const { result: raw, indexPrice, fetchedAt: windowTs } = await fetchDeribitOptions();
+    // 解析代理配置
+    const proxyUrl = req.headers.get('x-proxy-url') || null;
+
+    // 解析交易所参数
+    const sp = req.nextUrl.searchParams;
+    const exchange = sp.get('exchange') ?? 'deribit';
+    const adapter = getExchangeAdapter(exchange);
+
+    const { result: raw, indexPrice, fetchedAt: windowTs } = await adapter.fetchOptions(proxyUrl);
     const r = 0.0;
 
     const underlying = indexPrice > 0
@@ -262,34 +263,32 @@ export async function GET(_req: NextRequest) {
 
     for (const item of raw) {
       const name: string = item.instrument_name ?? '';
-      const parts = name.split('-');
-      if (parts.length !== 4 || parts[3] !== 'C') continue;
+      const parsed = adapter.parseInstrumentName(name);
+      if (!parsed) continue;
+      const { expiryStr, strike, optionType } = parsed;
+      if (optionType !== 'C') continue;
 
-      const [, expiryStr, strikeStr] = parts;
       const bid: number = item.bid_price;
       const ask: number = item.ask_price;
       if (!bid || !ask || bid <= 0 || ask <= 0) continue;
 
-      const strike = parseFloat(strikeStr);
       if (strike < underlying * 0.4 || strike > underlying * 2.0) continue;
 
-      let expiry: Date;
-      try {
-        expiry = new Date(`${expiryStr.slice(0, -2)} 20${expiryStr.slice(-2)} 08:00:00 UTC`);
-        if (isNaN(expiry.getTime())) {
-          const months: Record<string, number> = { JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5, JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11 };
-          const day = parseInt(expiryStr.replace(/[A-Z]/g, ''));
-          const monStr = expiryStr.slice(-5, -2).toUpperCase();
-          const yr = 2000 + parseInt(expiryStr.slice(-2));
-          expiry = new Date(Date.UTC(yr, months[monStr], day, 8, 0, 0));
-        }
-      } catch { continue; }
-      if (isNaN(expiry.getTime())) continue;
+      const expiry = adapter.parseExpiry(expiryStr, windowTs);
+      if (!expiry) continue;
 
       const T = (expiry.getTime() - windowTs) / (365 * 24 * 3600 * 1000);
       if (T <= 1 / 365) continue;
 
-      const iv = impliedVolatility(underlying, strike, T, r, ((bid + ask) / 2) * underlying);
+      // 根据交易所价格单位处理：Deribit 价格以 BTC 计价，Bybit 以 USD 计价
+      let midPrice: number;
+      if (adapter.priceInBTC) {
+        midPrice = ((bid + ask) / 2) * underlying;
+      } else {
+        midPrice = (bid + ask) / 2;
+      }
+
+      const iv = impliedVolatility(underlying, strike, T, r, midPrice);
       if (iv === null || iv < 0.05 || iv > 3.0) continue;
 
       if (!byExpiry.has(expiryStr)) byExpiry.set(expiryStr, { ks: [], ivs: [], tte: T });
